@@ -3057,13 +3057,13 @@ if __name__ == "__main__":
     OUTPUT_DIR = _default_output_dir()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    MAX_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_FUSION_EPOCHS", 100)
-    MAX_TEST_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_TEST_FUSION_EPOCHS", 100)
+    MAX_FUSION_EPOCHS = None
+    MAX_TEST_FUSION_EPOCHS = None
 
     # Table III: Adam, initial LR=0.01, Conv=24, LSTM=64 x 5, dropout=0.2.
     # Epoch count, batch size and validation split are unpublished completions.
-    NUM_EPOCHS = _env_int("MKNET_NUM_EPOCHS", 1)
-    BATCH_SIZE = _env_int("MKNET_BATCH_SIZE", 32)
+    NUM_EPOCHS = 10
+    BATCH_SIZE = 32
     LEARNING_RATE = 0.01
     GAMMA_L2 = 0.0
     VALIDATION_FRACTION = 0.20
