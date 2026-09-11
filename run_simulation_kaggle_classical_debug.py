@@ -1,0 +1,4776 @@
+"""Single-file GNSS/LEO/INS + Masked KalmanNet reproduction.
+
+This file inlines the former config.py, dataset_io.py, tc.py, and masked_cla.py
+so the complete current experiment can be inspected and executed from one file.
+
+Dataset protocol:
+- Data01 is used only for training/validation.
+- A distinct second SmartPNT-Pos dataset is used only for online testing/evaluation.
+  Test statistics never enter training, validation, or normalization.
+
+Intentional project differences from Yan et al. (2026) that are still retained:
+- pseudorange-only (no pseudorange-rate/Doppler)
+- TLE/SGP4 LEO orbit instead of STK/HPOP
+- ideal LEO satellite/receiver clock terms because the paper does not publish a
+  reproducible LEO clock-error generator for the simulated constellation
+- no FDE-DIA integrity stage
+- GPS/BDS receiver clocks are epoch-wise WLS nuisance parameters; their fitted
+  directions are projected consistently out of innovation, H, and R
+- the supplied IE truth exports do not contain accelerometer/gyro bias truth;
+  both classical history/warm-start and learned updates therefore correct only the
+  9 position/velocity/attitude states and keep the 6 nominal bias states frozen
+- Eqs. (10)-(15) are implemented causally: current innovation/IMU increments are
+  combined with the previous completed fusion state's residual/innovation terms.
+  The paper does not publish enough implementation detail to remove this causal
+  timing completion without introducing current-posterior information leakage.
+- The Masked CNN/LSTM/attention core follows Eqs. (22)-(29) and Table III.
+  The exact CNN tensorization, the pooling block drawn in Fig. 8, the exact FC
+  head dimensions, and the use/target of the inertial-measurement-error output
+  are not fully specified by the paper and remain explicit implementation choices.
+- The standalone masked_cla.py uses a full 15-row gain head with a position-only
+  one-step loss. That combination is NOT copied here because, without recurrent
+  end-to-end trajectory backpropagation, gain rows 3:15 receive no data gradient
+  yet would still be injected into navigation. This run instead supervises the
+  available 9 position/velocity/attitude correction rows and deterministically
+  zeros the 6 bias rows for which the supplied truth has no labels.
+- orchestration.py was audited as a workflow reference. Its strict GPST checks
+  and exact fusion-event scheduler are adopted here. Its stale single-truth,
+  single-dataset online path, old ideal-atmosphere/iid-LEO-noise path, and
+  position-only supervised pipeline are NOT adopted because they regress the
+  scientific fixes already present in this run.
+
+The LEO pseudorange atmosphere/error model follows Yan et al. Eq. (1)-(3).
+Per the current project choice, Ref. [35] supplies the ionospheric, tropospheric,
+and elevation-dependent multipath residual-error standard deviations. URA and
+receiver noise are intentionally omitted. Independent zero-mean stochastic
+realizations with those standard deviations are injected into the simulated LEO
+pseudorange so that its injected-error covariance is consistent with sigma_code_m.
+
+Runtime optimizations preserve the scientific state definition, units, masks, stochastic
+seeds/draw ordering, and float precision.  Most changes are algebraically exact.  The
+one deliberate speed/accuracy trade-off is Van Loan matrix-exponential evaluation: for
+small ||A*dt||_1 it uses a 10th-order Taylor series with a conservative norm gate and
+SciPy expm fallback; the configured gate keeps the exponential truncation bound near
+machine precision for normal 200 Hz IMU steps.  LEO receive-time elevation prefiltering
+uses a guard band, followed by the original exact transmit-time/final-elevation test for
+all candidates that could plausibly cross the mask.
+"""
+
+from __future__ import annotations
+
+from bisect import bisect_right
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from functools import lru_cache
+from pathlib import Path
+from time import perf_counter
+import csv
+import os
+import json
+import math
+import random
+import re
+import struct
+import xml.etree.ElementTree as ET
+
+import numpy as np
+import torch
+from torch import nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+from astropy import units as u
+from astropy.coordinates import CartesianDifferential, CartesianRepresentation, ITRS, TEME
+from astropy.time import Time
+from astropy.utils import iers
+from scipy.interpolate import BarycentricInterpolator
+from scipy.linalg import expm
+from scipy.spatial.transform import Rotation as SpatialRotation
+from sgp4.api import SGP4_ERRORS, Satrec, WGS72
+from sgp4.io import verify_checksum
+
+
+# =============================================================================
+# CONFIGURATION, CONSTANTS, AND COORDINATE/TIME UTILITIES
+# =============================================================================
+# -----------------------------------------------------------------------------
+# Physical constants (SI)
+# -----------------------------------------------------------------------------
+EARTH_SEMI_MAJOR_AXIS_M = 6378137.0
+EARTH_FLATTENING = 1.0 / 298.257223563
+EARTH_SEMI_MINOR_AXIS_M = EARTH_SEMI_MAJOR_AXIS_M * (1.0 - EARTH_FLATTENING)
+EARTH_ECCENTRICITY_SQUARED = EARTH_FLATTENING * (2.0 - EARTH_FLATTENING)
+EARTH_ROTATION_RATE_RADPS = 7.292115e-5
+EARTH_GRAVITATIONAL_PARAMETER_M3PS2 = 3.986004418e14
+SPEED_OF_LIGHT_MPS = 299792458.0
+GPS_EPOCH = datetime(1980, 1, 6, tzinfo=timezone.utc)
+GPS_WEEK_S = 604800.0
+
+# -----------------------------------------------------------------------------
+# Current experiment paths -- exact Kaggle layout
+# -----------------------------------------------------------------------------
+IN_KAGGLE = (
+    Path("/kaggle/input").is_dir()
+    and Path("/kaggle/working").is_dir()
+)
+
+KAGGLE_PROJECT_ROOT = Path(
+    os.environ.get(
+        "MKNET_PROJECT_ROOT",
+        "/kaggle/input/datasets/elasphin/mknet-project",
+    )
+)
+
+# In this Kaggle dataset Data01/Data02 live directly under the dataset root.
+DATASET_ROOT = KAGGLE_PROJECT_ROOT
+SMARTPNT_ROOT = KAGGLE_PROJECT_ROOT
+
+TRAIN_DATASET_DIR = (
+    DATASET_ROOT / "Data01_20230102_ISA-100C_Vehicle_Complex"
+)
+
+TEST_DATASET_DIR: Path | None = (
+    DATASET_ROOT / "Data02_20220309_ISA-100C_Vehicle_Complex"
+)
+
+DATASET_DIR = TRAIN_DATASET_DIR
+README_XML_PATH = TRAIN_DATASET_DIR / "README.xml"
+
+# IMUErrorModel.txt is stored at the Kaggle dataset root.
+IMU_ERROR_MODEL_PATH = KAGGLE_PROJECT_ROOT / "IMUErrorModel.txt"
+
+ROVE_GROUND_TRUTH_PATH = TRAIN_DATASET_DIR / "ROVE_GroundTruth.txt"
+IMU_GROUND_TRUTH_PATH = TRAIN_DATASET_DIR / "ISA-100C_GroundTruth.txt"
+RINEX_OBS_PATH = TRAIN_DATASET_DIR / "ROVE.23O"
+IMR_PATH = TRAIN_DATASET_DIR / "ISA-100C.imr"
+
+# Data01 precise products are stored at the dataset root.
+SP3_PATH = KAGGLE_PROJECT_ROOT / "WUM0MGXFIN_20230020000_01D_05M_ORB.SP3"
+CLK_PATH = KAGGLE_PROJECT_ROOT / "WUM0MGXFIN_20230020000_01D_30S_CLK.CLK"
+
+NAV_PATH = TRAIN_DATASET_DIR / "brdm0020.23p"
+
+# TLE directory confirmed in the Kaggle dataset.
+LEO_TLE_DIR = KAGGLE_PROJECT_ROOT / "LEO_TLE"
+
+
+def _env_optional_int(name: str, default: int | None) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    raw = raw.strip().lower()
+    if raw in {"", "none", "all"}:
+        return None
+    value = int(raw)
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer or 'none'")
+    return value
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = int(raw)
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _default_output_dir() -> Path:
+    override = os.environ.get("MKNET_OUTPUT_DIR")
+    if override:
+        return Path(override).expanduser()
+    if IN_KAGGLE:
+        return Path("/kaggle/working/direct_run")
+    return Path("direct_run")
+
+
+# Current project assumptions / settings.
+MAX_TRUTH_INTERPOLATION_GAP_S = 2.0
+MIN_GNSS_ELEVATION_DEG = 5.0
+USE_IONOSPHERE = True
+USE_TROPOSPHERE = True
+LEO_MIN_ELEVATION_DEG = 10.0
+LEO_SEED = 0
+TLE_MAX_AGE_DAYS = 1.0
+TLE_ALLOW_DEGRADED_EOP = False
+TLE_ALLOW_NON_TLE_FILES = True
+LEO_TX_EPSILON_POSITION_M = 1e-3
+LEO_TX_MAX_ITERATIONS = 20
+
+# Runtime/accuracy trade-off controls.
+# The final scientific LEO mask remains exactly LEO_MIN_ELEVATION_DEG.  This guard is
+# used only to avoid expensive transmit-time iteration for satellites clearly below it.
+LEO_PREFILTER_GUARD_DEG = 0.5
+
+# For ||A*dt||_1 <= 0.2, the Taylor-10 remainder bound is O(1e-15) in matrix norm.
+# Larger steps/states fall back to scipy.linalg.expm exactly.
+VAN_LOAN_TAYLOR_ORDER = 10
+VAN_LOAN_TAYLOR_MAX_NORM_1 = 0.20
+VAN_LOAN_VALIDATE_CALLS = 8
+
+# Yan et al. Eq. (2): the text places the ionosphere approximately between
+# 100 and 1000 km. The paper denotes these limits h_L and h_H but does not
+# list separate numerical values; using those stated bounds is a paper-guided
+# completion rather than an additional external model.
+LEO_IONOSPHERE_LOWER_HEIGHT_M = 100_000.0
+LEO_IONOSPHERE_UPPER_HEIGHT_M = 1_000_000.0
+
+
+@dataclass(frozen=True)
+class GPSTime:
+    week: int
+    tow_s: float
+
+
+def calendar_to_gpst_seconds(
+    year: int,
+    month: int,
+    day: int,
+    hour: int,
+    minute: int,
+    second: float,
+    time_system: str = "GPS",
+) -> float:
+    """Calendar epoch -> continuous GPST seconds."""
+    sec_int = int(math.floor(second))
+    dt = datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
+    base = (dt - GPS_EPOCH).total_seconds() + sec_int + (second - sec_int)
+    system = time_system.upper()
+    if system in {"GPS", "GPST", "GAL", "GST", "QZS", "QZSST", "IRN"}:
+        return float(base)
+    if system in {"BDT", "BDS"}:
+        return float(base + 14.0)
+    if system in {"UTC", "GLO"}:
+        return float(base + 18.0)
+    raise ValueError(f"Unsupported time system: {time_system}")
+
+
+def gpst_seconds_to_week_tow(time_gpst_s: float) -> GPSTime:
+    week = int(math.floor(float(time_gpst_s) / GPS_WEEK_S))
+    return GPSTime(week, float(time_gpst_s) - week * GPS_WEEK_S)
+
+
+def anchor_imr_tow_to_gpst_seconds(
+    tow_s: np.ndarray,
+    anchor_time_gpst_s: float,
+) -> np.ndarray:
+    """Attach GPS week(s) to IMR TOW and validate strict time ordering.
+
+    Runtime optimization: the original sample-by-sample week-unwrapping loop is
+    expressed with vectorized adjacent-TOW jumps and an integer cumulative sum.
+    The rollover rule, GPST values, and validation are unchanged.
+    """
+    tow_s = np.asarray(tow_s, dtype=float).reshape(-1)
+    if tow_s.size == 0:
+        return tow_s.copy()
+    if not np.all(np.isfinite(tow_s)):
+        raise ValueError("IMR TOW contains non-finite values")
+    if np.any((tow_s < 0.0) | (tow_s >= GPS_WEEK_S)):
+        raise ValueError("IMR TOW must lie in [0, 604800) seconds")
+    if not math.isfinite(float(anchor_time_gpst_s)):
+        raise ValueError("RINEX anchor time must be finite")
+
+    anchor_week = int(math.floor(float(anchor_time_gpst_s) / GPS_WEEK_S))
+    candidates = np.array([
+        (anchor_week + offset) * GPS_WEEK_S + tow_s[0]
+        for offset in (-1, 0, 1)
+    ])
+    first = float(
+        candidates[np.argmin(np.abs(candidates - float(anchor_time_gpst_s)))]
+    )
+    first_week = int(math.floor(first / GPS_WEEK_S))
+
+    if tow_s.size == 1:
+        return np.asarray([first], dtype=float)
+
+    delta_tow = np.diff(tow_s)
+    week_step = np.zeros(delta_tow.size, dtype=np.int64)
+    week_step[delta_tow < -0.5 * GPS_WEEK_S] = 1
+    week_step[delta_tow > 0.5 * GPS_WEEK_S] = -1
+    week_offset = np.empty(tow_s.size, dtype=np.int64)
+    week_offset[0] = 0
+    np.cumsum(week_step, out=week_offset[1:])
+    week_number = first_week + week_offset
+
+    time_gpst_s = week_number.astype(float) * GPS_WEEK_S + tow_s
+    time_gpst_s[0] = first
+    if np.any(np.diff(time_gpst_s) <= 0.0):
+        raise ValueError("anchored IMR GPST tags must be strictly increasing")
+    return time_gpst_s
+
+
+def validate_strict_time_axis(name: str, time_gpst_s: np.ndarray) -> np.ndarray:
+    """Return a finite, strictly increasing one-dimensional GPST time axis."""
+    time_gpst_s = np.asarray(time_gpst_s, dtype=float).reshape(-1)
+    if time_gpst_s.size == 0:
+        raise ValueError(f"{name} time axis is empty")
+    if not np.all(np.isfinite(time_gpst_s)):
+        raise ValueError(f"{name} time axis contains non-finite values")
+    if time_gpst_s.size > 1 and np.any(np.diff(time_gpst_s) <= 0.0):
+        raise ValueError(f"{name} time axis must be strictly increasing")
+    return time_gpst_s
+
+
+@dataclass(frozen=True)
+class PropagationSegment:
+    start_time_gpst_s: float
+    end_time_gpst_s: float
+    imu_index: int
+
+
+@dataclass(frozen=True)
+class FusionMarker:
+    time_gpst_s: float
+    fusion_index: int
+
+
+def build_exact_fusion_timeline(
+    imu_time_gpst_s: np.ndarray,
+    fusion_time_gpst_s: np.ndarray,
+    *,
+    through_last_fusion: bool = True,
+):
+    """Yield exact propagation/fusion events without materializing the timeline.
+
+    This is numerically identical to the previous scheduler, but it avoids creating
+    and retaining one Python object for every IMU propagation interval.
+    """
+    imu_time = validate_strict_time_axis("IMU", imu_time_gpst_s)
+    fusion_time = np.asarray(fusion_time_gpst_s, dtype=float).reshape(-1)
+
+    if fusion_time.size == 0:
+        return
+    validate_strict_time_axis("fusion", fusion_time)
+    if fusion_time[0] < imu_time[0] or fusion_time[-1] > imu_time[-1]:
+        raise ValueError("fusion epochs must lie inside the IMU time span")
+
+    if through_last_fusion:
+        stop = int(np.searchsorted(imu_time, fusion_time[-1], side="left")) + 1
+        imu_time = imu_time[:min(max(stop, 2), len(imu_time))]
+
+    fusion_index = 0
+    segment_start = float(imu_time[0])
+
+    for imu_index in range(1, len(imu_time)):
+        interval_end = float(imu_time[imu_index])
+
+        while (
+            fusion_index < len(fusion_time)
+            and fusion_time[fusion_index] <= interval_end + 1e-12
+        ):
+            t = float(fusion_time[fusion_index])
+            if t < segment_start - 1e-12:
+                raise RuntimeError(
+                    "fusion scheduler encountered a fusion epoch before "
+                    "the current propagation segment"
+                )
+            if t > segment_start + 1e-12:
+                yield PropagationSegment(segment_start, t, imu_index)
+            yield FusionMarker(t, fusion_index)
+            segment_start = t
+            fusion_index += 1
+
+        if interval_end > segment_start + 1e-12:
+            yield PropagationSegment(segment_start, interval_end, imu_index)
+        segment_start = interval_end
+
+    if fusion_index != len(fusion_time):
+        raise RuntimeError("not all requested fusion epochs were scheduled")
+
+
+def ecef_to_llh(position_ecef_m: np.ndarray) -> tuple[float, float, float]:
+    """ECEF [m] -> WGS-84 latitude [rad], longitude [rad], height [m]."""
+    x, y, z = np.asarray(position_ecef_m, dtype=float).reshape(3)
+    lon = float(np.arctan2(y, x))
+    p = float(np.hypot(x, y))
+    if p < 1e-8:
+        lat = np.pi / 2.0 if z >= 0.0 else -np.pi / 2.0
+        return float(lat), lon, float(abs(z) - EARTH_SEMI_MINOR_AXIS_M)
+
+    lat = float(np.arctan2(z, p * (1.0 - EARTH_ECCENTRICITY_SQUARED)))
+    for _ in range(15):
+        sin_lat = np.sin(lat)
+        N = EARTH_SEMI_MAJOR_AXIS_M / np.sqrt(
+            1.0 - EARTH_ECCENTRICITY_SQUARED * sin_lat * sin_lat
+        )
+        h = p / np.cos(lat) - N
+        new_lat = float(
+            np.arctan2(
+                z,
+                p * (1.0 - EARTH_ECCENTRICITY_SQUARED * N / (N + h)),
+            )
+        )
+        if abs(new_lat - lat) < 1e-13:
+            lat = new_lat
+            break
+        lat = new_lat
+
+    sin_lat = np.sin(lat)
+    N = EARTH_SEMI_MAJOR_AXIS_M / np.sqrt(
+        1.0 - EARTH_ECCENTRICITY_SQUARED * sin_lat * sin_lat
+    )
+    h = p / np.cos(lat) - N
+    return float(lat), lon, float(h)
+
+
+def c_ecef_to_ned(lat_rad: float, lon_rad: float) -> np.ndarray:
+    slat, clat = np.sin(lat_rad), np.cos(lat_rad)
+    slon, clon = np.sin(lon_rad), np.cos(lon_rad)
+    return np.array([
+        [-slat * clon, -slat * slon, clat],
+        [-slon, clon, 0.0],
+        [-clat * clon, -clat * slon, -slat],
+    ])
+
+
+def c_vehicle_to_body_zxy(x_rot_deg: float, y_rot_deg: float, z_rot_deg: float) -> np.ndarray:
+    """SmartPNT passive vehicle->body Z-X-Y mounting rotation."""
+    gamma, beta, alpha = np.deg2rad([x_rot_deg, y_rot_deg, z_rot_deg])
+    cb, sb = np.cos(beta), np.sin(beta)
+    cg, sg = np.cos(gamma), np.sin(gamma)
+    ca, sa = np.cos(alpha), np.sin(alpha)
+    Ry = np.array([[cb, 0.0, -sb], [0.0, 1.0, 0.0], [sb, 0.0, cb]])
+    Rx = np.array([[1.0, 0.0, 0.0], [0.0, cg, sg], [0.0, -sg, cg]])
+    Rz = np.array([[ca, sa, 0.0], [-sa, ca, 0.0], [0.0, 0.0, 1.0]])
+    return Ry @ Rx @ Rz
+
+
+def transform_lever_arm_vehicle_to_body(
+    lever_vehicle_m: np.ndarray,
+    x_rot_deg: float,
+    y_rot_deg: float,
+    z_rot_deg: float,
+) -> np.ndarray:
+    return c_vehicle_to_body_zxy(x_rot_deg, y_rot_deg, z_rot_deg) @ np.asarray(
+        lever_vehicle_m, dtype=float
+    ).reshape(3)
+
+
+def saastamoinen_delay_m(height_m: float, elevation_rad: float) -> float:
+    """Standard Saastamoinen tropospheric delay used by the current GNSS path."""
+    if elevation_rad <= 0.0:
+        return float("inf")
+    h = max(-100.0, min(float(height_m), 10000.0))
+    temperature_k = 15.0 - 0.0065 * h + 273.15
+    pressure_hpa = 1013.25 * (1.0 - 2.2557e-5 * h) ** 5.2568
+    water_vapor_hpa = 6.108 * 0.7 * math.exp(
+        (17.15 * (temperature_k - 273.15) - 4684.0) / (temperature_k - 38.45)
+    )
+    z = math.pi / 2.0 - elevation_rad
+    return 0.002277 / math.cos(z) * (
+        pressure_hpa + (1255.0 / temperature_k + 0.05) * water_vapor_hpa
+        - 1.16 * math.tan(z) ** 2
+    )
+
+
+def klobuchar_delay_m(
+    time_gps_tow_s: float,
+    latitude_rad: float,
+    longitude_rad: float,
+    elevation_rad: float,
+    azimuth_rad: float,
+    alpha_s,
+    beta_s,
+) -> float:
+    """GPS ICD Klobuchar model; returns delay in metres."""
+    alpha = np.asarray(alpha_s, dtype=float).reshape(4)
+    beta = np.asarray(beta_s, dtype=float).reshape(4)
+    lat_sc = latitude_rad / math.pi
+    lon_sc = longitude_rad / math.pi
+    elev_sc = elevation_rad / math.pi
+    psi = 0.0137 / (elev_sc + 0.11) - 0.022
+    phi_i = np.clip(lat_sc + psi * math.cos(azimuth_rad), -0.416, 0.416)
+    lam_i = lon_sc + psi * math.sin(azimuth_rad) / math.cos(phi_i * math.pi)
+    phi_m = phi_i + 0.064 * math.cos((lam_i - 1.617) * math.pi)
+    local_time_s = (43200.0 * lam_i + time_gps_tow_s) % 86400.0
+    basis = np.array([1.0, phi_m, phi_m**2, phi_m**3])
+    amplitude_s = max(0.0, float(alpha @ basis))
+    period_s = max(72000.0, float(beta @ basis))
+    phase = 2.0 * math.pi * (local_time_s - 50400.0) / period_s
+    F = 1.0 + 16.0 * (0.53 - elev_sc) ** 3
+    if abs(phase) < 1.57:
+        delay_s = F * (5e-9 + amplitude_s * (1.0 - phase**2 / 2.0 + phase**4 / 24.0))
+    else:
+        delay_s = F * 5e-9
+    return SPEED_OF_LIGHT_MPS * delay_s
+
+
+def geometric_range(
+    receiver_position_ecef_m: np.ndarray,
+    satellite_position_tx_ecef_m: np.ndarray,
+    transit_s: float,
+) -> tuple[float, np.ndarray, np.ndarray]:
+    """Earth-rotation corrected one-way range and satellite->receiver LOS."""
+    angle = EARTH_ROTATION_RATE_RADPS * float(transit_s)
+    c, s = np.cos(angle), np.sin(angle)
+    C_rx_tx = np.array([[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]])
+    sat_rx = C_rx_tx @ np.asarray(satellite_position_tx_ecef_m, dtype=float).reshape(3)
+    los = np.asarray(receiver_position_ecef_m, dtype=float).reshape(3) - sat_rx
+    rho = float(np.linalg.norm(los))
+    return rho, los / rho, sat_rx
+
+
+def elevation_azimuth_from_ned_matrix(
+    c_ecef_ned: np.ndarray,
+    los_satellite_to_receiver_ecef: np.ndarray,
+) -> tuple[float, float]:
+    """Elevation/azimuth using a receiver NED matrix already computed for the epoch."""
+    receiver_to_satellite_ned = np.asarray(c_ecef_ned, dtype=float) @ -np.asarray(
+        los_satellite_to_receiver_ecef, dtype=float
+    )
+    elevation = float(np.arcsin(np.clip(-receiver_to_satellite_ned[2], -1.0, 1.0)))
+    azimuth = float(np.arctan2(receiver_to_satellite_ned[1], receiver_to_satellite_ned[0]) % (2.0 * np.pi))
+    return elevation, azimuth
+
+
+def elevation_azimuth_from_ecef_los(
+    receiver_position_ecef_m: np.ndarray,
+    los_satellite_to_receiver_ecef: np.ndarray,
+) -> tuple[float, float]:
+    lat, lon, _ = ecef_to_llh(receiver_position_ecef_m)
+    return elevation_azimuth_from_ned_matrix(
+        c_ecef_to_ned(lat, lon),
+        los_satellite_to_receiver_ecef,
+    )
+
+
+# =============================================================================
+# DATASET READERS
+# =============================================================================
+# =============================================================================
+# IMU noise model
+# =============================================================================
+@dataclass(frozen=True)
+class IMUNoiseModel:
+    imu_type: str
+    isdv_pos_m: np.ndarray
+    isdv_vel_mps: np.ndarray
+    isdv_att_deg: np.ndarray
+    isdv_accel_bias_mps2: np.ndarray
+    isdv_gyro_bias_deg_s: np.ndarray
+    pnsd_pos_m_sqrt_s: np.ndarray
+    pnsd_vel_mps_sqrt_s: np.ndarray
+    pnsd_att_deg_sqrt_s: np.ndarray
+    pnsd_accel_bias_mps2_sqrt_s: np.ndarray
+    pnsd_gyro_bias_deg_s_sqrt_s: np.ndarray
+
+
+@dataclass(frozen=True)
+class IMUNoiseModelSI:
+    imu_type: str
+    isdv_pos_m: np.ndarray
+    isdv_vel_mps: np.ndarray
+    isdv_att_rad: np.ndarray
+    isdv_accel_bias_mps2: np.ndarray
+    isdv_gyro_bias_rad_s: np.ndarray
+    pnsd_pos_m_sqrt_s: np.ndarray
+    pnsd_vel_mps_sqrt_s: np.ndarray
+    pnsd_att_rad_sqrt_s: np.ndarray
+    pnsd_accel_bias_mps2_sqrt_s: np.ndarray
+    pnsd_gyro_bias_rad_s_sqrt_s: np.ndarray
+
+
+def imu_model_to_si(model: IMUNoiseModel) -> IMUNoiseModelSI:
+    d2r = np.pi / 180.0
+    return IMUNoiseModelSI(
+        model.imu_type,
+        model.isdv_pos_m.copy(),
+        model.isdv_vel_mps.copy(),
+        model.isdv_att_deg * d2r,
+        model.isdv_accel_bias_mps2.copy(),
+        model.isdv_gyro_bias_deg_s * d2r,
+        model.pnsd_pos_m_sqrt_s.copy(),
+        model.pnsd_vel_mps_sqrt_s.copy(),
+        model.pnsd_att_deg_sqrt_s * d2r,
+        model.pnsd_accel_bias_mps2_sqrt_s.copy(),
+        model.pnsd_gyro_bias_deg_s_sqrt_s * d2r,
+    )
+
+
+def read_imu_error_models(path: str | Path) -> dict[str, IMUNoiseModel]:
+    """Read SmartPNT IMUErrorModel.txt and return models by IMU type."""
+    text = Path(path).read_text(encoding="utf-8", errors="replace")
+    keys = (
+        "ISDV_Pos", "ISDV_Vel", "ISDV_Att", "ISDV_AccelBias", "ISDV_GyrosBias",
+        "PNSD_Pos", "PNSD_Vel", "PNSD_Att", "PNSD_AccelBias", "PNSD_GyrosBias",
+    )
+    models = {}
+    for match in re.finditer(r"IMU\s*\{(.*?)\}", text, flags=re.S):
+        block = match.group(1)
+        type_match = re.search(r'IMU_Type\s*=\s*"([^"]+)"', block)
+        if not type_match:
+            continue
+        values = {}
+        for key in keys:
+            value_match = re.search(rf"{key}\s*=\s*([^\r\n]+)", block)
+            if value_match:
+                values[key] = np.fromstring(value_match.group(1), sep=" ", dtype=float)
+        if len(values) != len(keys):
+            continue
+        imu_type = type_match.group(1)
+        models[imu_type] = IMUNoiseModel(
+            imu_type,
+            values["ISDV_Pos"], values["ISDV_Vel"], values["ISDV_Att"],
+            values["ISDV_AccelBias"], values["ISDV_GyrosBias"],
+            values["PNSD_Pos"], values["PNSD_Vel"], values["PNSD_Att"],
+            values["PNSD_AccelBias"], values["PNSD_GyrosBias"],
+        )
+    return models
+
+
+# =============================================================================
+# RINEX observation: one pseudorange signal per GPS/BDS satellite
+# =============================================================================
+_FREQUENCY_HZ = {
+    ("G", "1"): 1575.42e6,
+    ("G", "2"): 1227.60e6,
+    ("G", "5"): 1176.45e6,
+    ("C", "1"): 1575.42e6,
+    ("C", "2"): 1561.098e6,
+    ("C", "5"): 1176.45e6,
+    ("C", "7"): 1207.140e6,
+    ("C", "8"): 1191.795e6,
+    ("C", "6"): 1268.52e6,
+}
+_SIGNAL_PREFS = {
+    "G": ("1C", "1W", "1P", "2W", "2L", "2X", "5Q", "5X", "5I"),
+    "C": ("2I", "1I", "2X", "1X", "1P", "1D", "5X", "5P", "5D", "7I", "7X", "6I", "6X"),
+}
+
+
+@dataclass(frozen=True)
+class SelectedSignal:
+    suffix: str
+    code_type: str
+    frequency_hz: float
+
+
+@dataclass(frozen=True)
+class SatelliteMeasurement:
+    sat_id: str
+    constellation: str
+    signal: SelectedSignal
+    pseudorange_m: float
+    cn0_dbhz: float | None = None
+
+
+@dataclass(frozen=True)
+class ObservationEpoch:
+    time_gpst_s: float
+    gps_week: int
+    tow_s: float
+    measurements: tuple[SatelliteMeasurement, ...]
+
+
+class RINEXObservationFile:
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self.version = 0.0
+        self.time_scale = "GPS"
+        self.observation_types: dict[str, tuple[str, ...]] = {}
+        self._index_by_type: dict[str, dict[str, int]] = {}
+        self._read_header()
+
+    @classmethod
+    def open(cls, path: str | Path) -> "RINEXObservationFile":
+        return cls(path)
+
+    def _read_header(self) -> None:
+        types: dict[str, list[str]] = {}
+        counts: dict[str, int] = {}
+        current_system = None
+        with self.path.open("r", encoding="ascii", errors="replace") as f:
+            first = f.readline()
+            self.version = float(first[:9])
+            for line in f:
+                label = line[60:80].strip() if len(line) >= 60 else ""
+                if label == "END OF HEADER":
+                    break
+                if label == "TIME OF FIRST OBS":
+                    self.time_scale = line[48:51].strip() or "GPS"
+                elif label == "SYS / # / OBS TYPES":
+                    if line[0:1].strip():
+                        current_system = line[0]
+                        counts[current_system] = int(line[3:6])
+                        types[current_system] = []
+                    if current_system:
+                        types[current_system].extend(line[7:60].split())
+                        types[current_system] = types[current_system][:counts[current_system]]
+        self.observation_types = {system: tuple(values) for system, values in types.items()}
+        self._index_by_type = {
+            system: {obs_type: i for i, obs_type in enumerate(values)}
+            for system, values in self.observation_types.items()
+        }
+
+    def _select_signal_and_pseudorange(
+        self,
+        constellation: str,
+        obs_types: tuple[str, ...],
+        fields: list[str],
+    ) -> tuple[SelectedSignal, float] | None:
+        """Choose the first preferred pseudorange that is valid for this satellite/epoch.
+
+        RINEX observation types are declared per constellation in the header, but an
+        individual satellite can have a blank/invalid value for the most-preferred
+        code while another supported pseudorange is present. Selection therefore
+        must be performed on the actual fields of each satellite record, not once
+        for the entire constellation.
+        """
+        index_by_type = self._index_by_type.get(constellation, {})
+        for suffix in _SIGNAL_PREFS.get(constellation, ()):
+            code_type = "C" + suffix
+            index = index_by_type.get(code_type)
+            if index is None or index >= len(fields):
+                continue
+
+            raw = fields[index].ljust(16)[:14].strip()
+            if not raw:
+                continue
+            try:
+                pseudorange = float(raw.replace("D", "E"))
+            except ValueError:
+                continue
+            if not math.isfinite(pseudorange) or pseudorange <= 0.0:
+                continue
+
+            if constellation == "C" and self.version < 3.04 and suffix in {"1I", "1Q", "1X"}:
+                frequency = 1561.098e6
+            else:
+                frequency = _FREQUENCY_HZ.get((constellation, suffix[0]))
+            if frequency is None:
+                continue
+
+            return SelectedSignal(suffix, code_type, frequency), float(pseudorange)
+        return None
+
+    @staticmethod
+    def _fields(first_payload: str, stream, count: int) -> list[str]:
+        payload = first_payload.rstrip("\n")
+        fields = [payload[i:i + 16] for i in range(0, len(payload), 16)]
+        while len(fields) < count:
+            line = stream.readline()
+            if not line:
+                break
+            payload = line[3:].rstrip("\n")
+            fields.extend(payload[i:i + 16] for i in range(0, len(payload), 16))
+        return fields[:count]
+
+    def iter_epochs(
+        self,
+        allowed_constellations: set[str] | None = None,
+        *,
+        start_time_gpst_s: float | None = None,
+        end_time_gpst_s: float | None = None,
+        max_epochs: int | None = None,
+        require_measurements: bool = False,
+    ):
+        """Iterate RINEX epochs with optional exact time/counter pruning.
+
+        The parser still reads each selected epoch identically.  The optional bounds
+        only stop work that the main pipeline would later discard anyway.
+        """
+        yielded = 0
+        with self.path.open("r", encoding="ascii", errors="replace") as stream:
+            for line in stream:
+                if len(line) >= 60 and line[60:80].strip() == "END OF HEADER":
+                    break
+
+            for line in stream:
+                if not line.startswith(">"):
+                    continue
+                parts = line[1:].split()
+                if len(parts) < 8:
+                    continue
+                year, month, day, hour, minute = map(int, parts[:5])
+                second = float(parts[5])
+                epoch_flag = int(parts[6])
+                satellite_count = int(parts[7])
+                if epoch_flag not in (0, 1):
+                    for _ in range(satellite_count):
+                        stream.readline()
+                    continue
+
+                time_gpst_s = calendar_to_gpst_seconds(
+                    year, month, day, hour, minute, second, self.time_scale
+                )
+                # RINEX epochs are time ordered.  Once the upper bound is crossed,
+                # no later epoch can be used by this run.
+                if end_time_gpst_s is not None and time_gpst_s > float(end_time_gpst_s):
+                    break
+
+                gps_time = gpst_seconds_to_week_tow(time_gpst_s)
+                measurements = []
+
+                for _ in range(satellite_count):
+                    sat_line = stream.readline()
+                    if not sat_line:
+                        break
+                    sat_id = sat_line[:3].strip()
+                    if not sat_id:
+                        continue
+                    constellation = sat_id[0]
+                    obs_types = self.observation_types.get(constellation, ())
+                    fields = self._fields(sat_line[3:], stream, len(obs_types))
+                    if allowed_constellations and constellation not in allowed_constellations:
+                        continue
+                    selected = self._select_signal_and_pseudorange(
+                        constellation, obs_types, fields
+                    )
+                    if selected is None:
+                        continue
+                    signal, pseudorange = selected
+
+                    snr_type = "S" + signal.suffix
+                    cn0 = None
+                    snr_index = self._index_by_type.get(constellation, {}).get(snr_type)
+                    if snr_index is not None and snr_index < len(fields):
+                        raw_snr = fields[snr_index].ljust(16)[:14].strip()
+                        if raw_snr:
+                            value = float(raw_snr.replace("D", "E"))
+                            cn0 = value if math.isfinite(value) else None
+                    measurements.append(
+                        SatelliteMeasurement(sat_id, constellation, signal, pseudorange, cn0)
+                    )
+
+                if start_time_gpst_s is not None and time_gpst_s < float(start_time_gpst_s):
+                    continue
+                if require_measurements and not measurements:
+                    continue
+
+                yield ObservationEpoch(
+                    time_gpst_s, gps_time.week, gps_time.tow_s, tuple(measurements)
+                )
+                yielded += 1
+                if max_epochs is not None and yielded >= int(max_epochs):
+                    break
+
+
+# =============================================================================
+# RINEX precise clock
+# =============================================================================
+class RINEXClock:
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self.time_scale = "GPS"
+        self._series = self._parse()
+        self._satellites = tuple(sorted(self._series))
+        self._satellite_set = frozenset(self._series)
+
+    def _parse(self):
+        records = defaultdict(lambda: [[], [], []])
+        with self.path.open("r", encoding="ascii", errors="replace") as stream:
+            stream.readline()
+            for line in stream:
+                label = line[60:80].strip() if len(line) >= 60 else ""
+                if label == "END OF HEADER":
+                    break
+                if label == "TIME SYSTEM ID":
+                    fields = line[:10].split()
+                    if fields:
+                        self.time_scale = fields[0]
+
+            for line in stream:
+                if line[:2] != "AS":
+                    continue
+                fields = line.split()
+                if len(fields) < 10:
+                    continue
+                sat_id = fields[1]
+                year, month, day, hour, minute = map(int, fields[2:7])
+                second = float(fields[7])
+                value_count = int(fields[8])
+                values = [float(x.replace("D", "E")) for x in fields[9:]]
+                while len(values) < value_count:
+                    values.extend(float(x.replace("D", "E")) for x in stream.readline().split())
+                t = calendar_to_gpst_seconds(year, month, day, hour, minute, second, self.time_scale)
+                records[sat_id][0].append(t)
+                records[sat_id][1].append(values[0])
+                records[sat_id][2].append(values[2] if value_count >= 3 else np.nan)
+
+        out = {}
+        for sat_id, (times, bias, drift) in records.items():
+            order = np.argsort(times)
+            out[sat_id] = (
+                np.asarray(times)[order],
+                np.asarray(bias)[order],
+                np.asarray(drift)[order],
+            )
+        return out
+
+    @property
+    def satellites(self) -> tuple[str, ...]:
+        return self._satellites
+
+    def has_satellite(self, sat_id: str) -> bool:
+        return sat_id in self._satellite_set
+
+    def bias(self, sat_id: str, time_gpst_s: float) -> float:
+        times, bias, _ = self._series[sat_id]
+        if time_gpst_s < times[0] or time_gpst_s > times[-1]:
+            raise ValueError(f"CLK time outside product span for {sat_id}")
+        return float(np.interp(time_gpst_s, times, bias))
+
+
+
+# =============================================================================
+# RINEX navigation header: Klobuchar coefficients only
+# =============================================================================
+def read_rinex_navigation_header(path: str | Path) -> dict[str, tuple[float, ...]]:
+    """Return only the IONOSPHERIC CORR fields used by Klobuchar."""
+    corrections = {}
+    with Path(path).open("r", encoding="ascii", errors="replace") as stream:
+        stream.readline()
+        for line in stream:
+            label = line[60:80].strip() if len(line) >= 60 else ""
+            if label == "END OF HEADER":
+                break
+            if label == "IONOSPHERIC CORR":
+                fields = line[:60].split()
+                if len(fields) >= 5:
+                    corrections[fields[0]] = tuple(float(x.replace("D", "E")) for x in fields[1:5])
+    return corrections
+
+
+
+# =============================================================================
+# SP3 precise orbit
+# =============================================================================
+class SP3Orbit:
+    def __init__(self, path: str | Path, interpolation_points: int = 9):
+        self.path = Path(path)
+        self.interpolation_points = interpolation_points
+        self.series = self._parse()
+
+    def _parse(self):
+        temporary = defaultdict(lambda: [[], [], []])
+        velocities = {}
+        drifts = {}
+        current_time = None
+        time_scale = "GPS"
+
+        with self.path.open("r", encoding="ascii", errors="replace") as stream:
+            for line in stream:
+                if line.startswith("%c") and len(line) >= 12:
+                    candidate = line[9:12].strip()
+                    # The first SP3 ``%c`` record carries the time system. The
+                    # following record commonly contains the literal placeholder
+                    # ``ccc`` in the same columns and must not overwrite it.
+                    if candidate.upper() in {
+                        "GPS", "GPST", "GAL", "GST", "QZS", "IRN",
+                        "BDT", "BDS", "UTC", "GLO",
+                    }:
+                        time_scale = candidate
+                elif line.startswith("*"):
+                    f = line[1:].split()
+                    current_time = calendar_to_gpst_seconds(
+                        int(f[0]), int(f[1]), int(f[2]), int(f[3]), int(f[4]), float(f[5]), time_scale
+                    )
+                elif current_time is not None and line.startswith("P"):
+                    sat_id = line[1:4].strip()
+                    v = line[4:].split()
+                    if len(v) < 4:
+                        continue
+                    pos_km = np.asarray(v[:3], dtype=float)
+                    if np.any(np.abs(pos_km) >= 999999.0) or np.allclose(pos_km, 0.0):
+                        continue
+                    clock_us = float(v[3])
+                    temporary[sat_id][0].append(current_time)
+                    temporary[sat_id][1].append(pos_km * 1000.0)
+                    temporary[sat_id][2].append(np.nan if abs(clock_us) >= 999999.0 else clock_us * 1e-6)
+                elif current_time is not None and line.startswith("V"):
+                    sat_id = line[1:4].strip()
+                    v = line[4:].split()
+                    if len(v) < 4:
+                        continue
+                    velocities[(sat_id, current_time)] = np.asarray(v[:3], dtype=float) * 0.1
+                    rate = float(v[3])
+                    drifts[(sat_id, current_time)] = np.nan if abs(rate) >= 999999.0 else rate * 1e-10
+
+        series = {}
+        for sat_id, (times, positions, clocks) in temporary.items():
+            times = np.asarray(times, dtype=float)
+            order = np.argsort(times)
+            times = times[order]
+            clock = np.asarray(clocks, dtype=float)[order]
+            velocity = np.vstack([
+                velocities.get((sat_id, float(t)), [np.nan] * 3) for t in times
+            ])
+            drift = np.asarray([
+                drifts.get((sat_id, float(t)), np.nan) for t in times
+            ])
+            finite_clock = np.isfinite(clock)
+            finite_drift = np.isfinite(drift)
+            series[sat_id] = {
+                "time": times,
+                "position": np.asarray(positions, dtype=float)[order],
+                "clock": clock,
+                "velocity": velocity,
+                "velocity_finite": np.all(np.isfinite(velocity), axis=1),
+                "drift": drift,
+                "clock_time": times[finite_clock],
+                "clock_value": clock[finite_clock],
+                "drift_time": times[finite_drift],
+                "drift_value": drift[finite_drift],
+            }
+        return series
+
+    @staticmethod
+    def _interpolate(times: np.ndarray, values: np.ndarray, query: float):
+        scale = max(float(np.max(np.abs(times - query))), 1.0)
+        x = (times - query) / scale
+        y, dy = [], []
+        for column in range(values.shape[1]):
+            p = BarycentricInterpolator(x, values[:, column], rng=0)
+            y.append(float(p(0.0)))
+            dy.append(float(p.derivative(0.0)) / scale)
+        return np.asarray(y), np.asarray(dy)
+
+    @staticmethod
+    def _interpolate_values_only(times: np.ndarray, values: np.ndarray, query: float):
+        """Same barycentric position interpolation without unused derivatives."""
+        scale = max(float(np.max(np.abs(times - query))), 1.0)
+        x = (times - query) / scale
+        y = []
+        for column in range(values.shape[1]):
+            p = BarycentricInterpolator(x, values[:, column], rng=0)
+            y.append(float(p(0.0)))
+        return np.asarray(y)
+
+    def position(self, sat_id: str, time_gpst_s: float) -> np.ndarray:
+        """SP3 position using the exact same interpolation window as state()."""
+        s = self.series[sat_id]
+        times = s["time"]
+        if time_gpst_s < times[0] or time_gpst_s > times[-1]:
+            raise ValueError(f"SP3 time outside product span for {sat_id}")
+        count = min(self.interpolation_points, len(times))
+        i = int(np.searchsorted(times, time_gpst_s))
+        start = max(0, min(len(times) - count, i - count // 2))
+        w = slice(start, start + count)
+        return self._interpolate_values_only(
+            times[w], s["position"][w], time_gpst_s
+        )
+
+    def clock_bias(self, sat_id: str, time_gpst_s: float) -> float | None:
+        """SP3 clock bias without computing position/velocity."""
+        s = self.series[sat_id]
+        times = s["time"]
+        if time_gpst_s < times[0] or time_gpst_s > times[-1]:
+            raise ValueError(f"SP3 time outside product span for {sat_id}")
+        if s["clock_time"].size == 0:
+            return None
+        return float(np.interp(time_gpst_s, s["clock_time"], s["clock_value"]))
+
+    def state(self, sat_id: str, time_gpst_s: float):
+        s = self.series[sat_id]
+        times = s["time"]
+        if time_gpst_s < times[0] or time_gpst_s > times[-1]:
+            raise ValueError(f"SP3 time outside product span for {sat_id}")
+        count = min(self.interpolation_points, len(times))
+        i = int(np.searchsorted(times, time_gpst_s))
+        start = max(0, min(len(times) - count, i - count // 2))
+        w = slice(start, start + count)
+        position, position_derivative = self._interpolate(times[w], s["position"][w], time_gpst_s)
+        native_velocity = s["velocity"][w]
+        finite_v = s["velocity_finite"][w]
+        if finite_v.sum() >= 2:
+            velocity, _ = self._interpolate(times[w][finite_v], native_velocity[finite_v], time_gpst_s)
+        else:
+            velocity = position_derivative
+        clock = (
+            None
+            if s["clock_time"].size == 0
+            else float(np.interp(time_gpst_s, s["clock_time"], s["clock_value"]))
+        )
+        drift = (
+            None
+            if s["drift_time"].size == 0
+            else float(np.interp(time_gpst_s, s["drift_time"], s["drift_value"]))
+        )
+        return position, velocity, clock, drift
+
+
+# =============================================================================
+# SmartPNT IMR
+# =============================================================================
+IMR_HEADER_FORMAT_BODY = "8scdiidddiid32s?BBB32s6h?iii354s"
+IMR_RECORD_FORMAT_BODY = "d6i"
+
+
+@dataclass(frozen=True)
+class IMRHeader:
+    endian: str
+    delta_theta: int
+    delta_velocity: int
+    data_rate_hz: float
+    gyro_scale: float
+    accel_scale: float
+    utc_or_gps_time: int
+    receiver_or_corrected_time: int
+    time_tag_bias_ms: float
+
+
+@dataclass
+class IMRData:
+    header: IMRHeader
+    tow_s: np.ndarray
+    angular_rate_body_radps: np.ndarray
+    acceleration_body_mps2: np.ndarray
+    raw_gyro_counts: np.ndarray
+    raw_accel_counts: np.ndarray
+
+
+def _read_imr_layout(path: str | Path) -> tuple[Path, IMRHeader, np.dtype, int, int]:
+    """Read only the fixed IMR header and binary-record layout metadata."""
+    path = Path(path)
+    with path.open("rb") as stream:
+        buffer = stream.read(512)
+    endian = "<" if buffer[8] == 0 else ">"
+    values = struct.unpack(endian + IMR_HEADER_FORMAT_BODY, buffer)
+    header = IMRHeader(
+        endian=endian,
+        delta_theta=int(values[3]),
+        delta_velocity=int(values[4]),
+        data_rate_hz=float(values[5]),
+        gyro_scale=float(values[6]),
+        accel_scale=float(values[7]),
+        utc_or_gps_time=int(values[8]),
+        receiver_or_corrected_time=int(values[9]),
+        time_tag_bias_ms=float(values[10]),
+    )
+
+    record_bytes = struct.calcsize(endian + IMR_RECORD_FORMAT_BODY)
+    payload_bytes = max(0, path.stat().st_size - 512)
+    record_count = payload_bytes // record_bytes
+    record_dtype = np.dtype([
+        ("tow", endian + "f8"),
+        ("counts", endian + "i4", (6,)),
+    ], align=False)
+    if record_dtype.itemsize != record_bytes:
+        raise RuntimeError("NumPy IMR dtype does not match the documented record size")
+    return path, header, record_dtype, record_count, record_bytes
+
+
+def _adjust_imr_tow(tow: np.ndarray, header: IMRHeader) -> np.ndarray:
+    tow = np.asarray(tow, dtype=np.float64)
+    tow = np.where(tow > 604800.0, tow - 604800.0, tow)
+    tow -= header.time_tag_bias_ms * 1e-3
+    return tow
+
+
+def read_imr_tow_only(path: str | Path) -> tuple[IMRHeader, np.ndarray, int]:
+    """Read only IMR time tags.
+
+    A memory map exposes the strided TOW field without converting the six raw-count
+    channels.  This lets partial/debug runs determine the exact required IMU window
+    before allocating and scaling the sensor arrays.
+    """
+    path, header, record_dtype, record_count, _ = _read_imr_layout(path)
+    records = np.memmap(
+        path, dtype=record_dtype, mode="r", offset=512, shape=(record_count,)
+    )
+    tow = np.asarray(records["tow"], dtype=np.float64).copy()
+    del records
+    return header, _adjust_imr_tow(tow, header), record_count
+
+
+def read_imr(
+    path: str | Path,
+    scaling_mode: str = "cpp_exact",
+    *,
+    start_record: int = 0,
+    stop_record: int | None = None,
+) -> IMRData:
+    """Read an exact contiguous SmartPNT IMR record window.
+
+    The binary layout, scaling equations, float precision, units, and sample order are
+    unchanged.  For partial runs only records that can influence the requested fusion
+    epochs are converted to floating-point sensor values.
+    """
+    path, header, record_dtype, record_count, record_bytes = _read_imr_layout(path)
+    start_record = int(start_record)
+    if stop_record is None:
+        stop_record = record_count
+    stop_record = int(stop_record)
+    if not (0 <= start_record <= stop_record <= record_count):
+        raise ValueError(
+            f"invalid IMR record window [{start_record}, {stop_record}) for {record_count} records"
+        )
+
+    count = stop_record - start_record
+    records = np.fromfile(
+        path,
+        dtype=record_dtype,
+        count=count,
+        offset=512 + start_record * record_bytes,
+    )
+    tow = _adjust_imr_tow(records["tow"].astype(np.float64, copy=True), header)
+    counts = records["counts"]
+    gyro_counts = counts[:, :3]
+    accel_counts = counts[:, 3:6]
+
+    gyro = gyro_counts.astype(float) * header.gyro_scale
+    accel = accel_counts.astype(float) * header.accel_scale
+    if scaling_mode == "cpp_exact":
+        gyro *= header.data_rate_hz
+        accel *= header.data_rate_hz
+    else:
+        if header.delta_theta:
+            gyro *= header.data_rate_hz
+        if header.delta_velocity:
+            accel *= header.data_rate_hz
+
+    return IMRData(
+        header,
+        tow,
+        np.deg2rad(gyro),
+        accel,
+        gyro_counts,
+        accel_counts,
+    )
+
+
+# =============================================================================
+# SmartPNT README.xml
+# =============================================================================
+@dataclass(frozen=True)
+class RoverMetadata:
+    imu_type: str
+    lever_arm_vehicle_m: np.ndarray
+    mounting_xyz_deg: np.ndarray
+
+
+def load_smartpnt_metadata(path: str | Path, rover_id: str = "01") -> RoverMetadata:
+    root = ET.fromstring(Path(path).read_text(encoding="utf-8", errors="replace"))
+    for rover in root.findall("ROVE"):
+        if (rover.findtext("ID") or "").strip() == str(rover_id):
+            return RoverMetadata(
+                (rover.findtext("SINS_IMUType") or "").strip(),
+                np.fromstring(rover.findtext("SINS_LeverArm_GNSS") or "", sep=" "),
+                np.fromstring(rover.findtext("SINS_RotAngle_IMU") or "", sep=" "),
+            )
+    raise KeyError(f"Rover {rover_id} not found")
+
+
+@dataclass(frozen=True)
+class DatasetFiles:
+    root: Path
+    readme_xml: Path
+    rover_ground_truth: Path
+    imu_ground_truth: Path
+    rinex_obs: Path
+    imr: Path
+    sp3: Path
+    clk: Path
+    nav: Path
+
+
+def _unique_file(directory: Path, patterns: tuple[str, ...], label: str) -> Path:
+    matches = []
+    for pattern in patterns:
+        matches.extend(path for path in directory.glob(pattern) if path.is_file())
+    matches = sorted(set(matches))
+    if len(matches) != 1:
+        names = ", ".join(path.name for path in matches) or "none"
+        raise FileNotFoundError(
+            f"Expected exactly one {label} file in {directory}, found {len(matches)}: {names}"
+        )
+    return matches[0]
+
+
+def resolve_dataset_files(dataset_dir: str | Path, rover_id: str = "01") -> tuple[DatasetFiles, RoverMetadata]:
+    """Resolve one SmartPNT-Pos dataset without assuming date-specific product filenames."""
+    root = Path(dataset_dir)
+    readme = root / "README.xml"
+    if not readme.exists():
+        raise FileNotFoundError(f"Missing README.xml in dataset: {root}")
+
+    rover = load_smartpnt_metadata(readme, rover_id)
+    imu_truth = root / f"{rover.imu_type}_GroundTruth.txt"
+    imr = root / f"{rover.imu_type}.imr"
+    rover_truth = _unique_file(
+        root,
+        (
+            "ROVE_GroundTruth.txt",
+            f"ROVE_{rover_id}_GroundTruth.txt",
+            f"Rove_{rover_id}_GroundTruth.txt",
+        ),
+        f"rover {rover_id} ground truth",
+    )
+    rover_observation = _unique_file(
+        root,
+        (
+            "ROVE.*O",
+            "ROVE.*o",
+            f"ROVE_{rover_id}.*O",
+            f"ROVE_{rover_id}.*o",
+        ),
+        f"rover {rover_id} RINEX observation",
+    )
+
+    files = DatasetFiles(
+        root=root,
+        readme_xml=readme,
+        rover_ground_truth=rover_truth,
+        imu_ground_truth=imu_truth,
+        rinex_obs=rover_observation,
+        imr=imr,
+        sp3=_unique_file(root, ("*.SP3", "*.sp3"), "SP3 precise-orbit"),
+        clk=_unique_file(root, ("*.CLK", "*.clk"), "RINEX clock"),
+        nav=_unique_file(root, ("brdm*.*p", "brdm*.*P", "brdm*.rnx", "BRDM*.RNX"), "broadcast navigation"),
+    )
+    required = [
+        files.readme_xml, files.rover_ground_truth, files.imu_ground_truth, files.rinex_obs,
+        files.imr, files.sp3, files.clk, files.nav,
+    ]
+    missing = [str(path) for path in required if not path.exists()]
+    if missing:
+        raise FileNotFoundError("Missing dataset files:\n" + "\n".join(missing))
+    return files, rover
+
+
+def resolve_test_dataset_dir() -> Path:
+    """Select the explicitly configured test dataset or the single non-training dataset."""
+    if TEST_DATASET_DIR is not None:
+        return Path(TEST_DATASET_DIR)
+
+    candidates = sorted(
+        path for path in DATASET_ROOT.iterdir()
+        if path.is_dir() and path.resolve() != TRAIN_DATASET_DIR.resolve()
+    )
+    if len(candidates) != 1:
+        names = ", ".join(path.name for path in candidates) or "none"
+        raise RuntimeError(
+            "TEST_DATASET_DIR is not set and automatic selection is ambiguous. "
+            f"Found {len(candidates)} non-training dataset directories: {names}. "
+            "Set TEST_DATASET_DIR to the exact second SmartPNT-Pos dataset."
+        )
+    return candidates[0]
+
+
+# =============================================================================
+# Inertial Explorer ground truth: only fields used by this project
+# =============================================================================
+@dataclass
+class GroundTruth:
+    week: np.ndarray
+    tow_s: np.ndarray
+    position_ecef_m: np.ndarray
+    velocity_ecef_mps: np.ndarray
+    heading_deg: np.ndarray
+    pitch_deg: np.ndarray
+    roll_deg: np.ndarray
+
+
+def load_ie_ground_truth(path: str | Path) -> GroundTruth:
+    lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+    rows = []
+    started = False
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 24:
+            if started:
+                break
+            continue
+        try:
+            row = (
+                int(fields[0]), float(fields[1]),
+                float(fields[9]), float(fields[10]), float(fields[11]),
+                float(fields[15]), float(fields[16]), float(fields[17]),
+                float(fields[21]), float(fields[22]), float(fields[23]),
+            )
+        except (ValueError, IndexError):
+            if started:
+                break
+            continue
+        started = True
+        rows.append(row)
+
+    a = np.asarray(rows, dtype=float)
+    return GroundTruth(
+        a[:, 0].astype(int),
+        a[:, 1],
+        a[:, 2:5],
+        a[:, 5:8],
+        a[:, 8],
+        a[:, 9],
+        a[:, 10],
+    )
+
+
+def interpolate_ground_truth(
+    truth: GroundTruth,
+    query_time_gpst_s: np.ndarray,
+    max_gap_s: float,
+):
+    """Interpolate IE position/velocity/HPR at requested GPST epochs."""
+    truth_time = truth.week.astype(float) * GPS_WEEK_S + truth.tow_s
+    query = np.asarray(query_time_gpst_s, dtype=float)
+    upper = np.searchsorted(truth_time, query, side="left")
+    upper = np.clip(upper, 0, len(truth_time) - 1)
+    lower = np.maximum(upper - 1, 0)
+    exact = truth_time[upper] == query
+    lower[exact] = upper[exact]
+    gap = truth_time[upper] - truth_time[lower]
+    if np.any(gap > float(max_gap_s)):
+        raise ValueError("Ground-truth interpolation gap is too large")
+    if np.any(query < truth_time[0]) or np.any(query > truth_time[-1]):
+        raise ValueError("Requested epoch is outside ground-truth time span")
+
+    weight = np.zeros_like(query)
+    nz = gap > 0.0
+    weight[nz] = (query[nz] - truth_time[lower[nz]]) / gap[nz]
+    w0 = 1.0 - weight
+
+    position = w0[:, None] * truth.position_ecef_m[lower] + weight[:, None] * truth.position_ecef_m[upper]
+    velocity = w0[:, None] * truth.velocity_ecef_mps[lower] + weight[:, None] * truth.velocity_ecef_mps[upper]
+    heading_unwrapped = np.unwrap(np.deg2rad(truth.heading_deg))
+    heading = np.rad2deg(w0 * heading_unwrapped[lower] + weight * heading_unwrapped[upper]) % 360.0
+    pitch = w0 * truth.pitch_deg[lower] + weight * truth.pitch_deg[upper]
+    roll = w0 * truth.roll_deg[lower] + weight * truth.roll_deg[upper]
+    return position, velocity, heading, pitch, roll
+
+
+def body_to_ecef_from_ie_hpr(
+    position_ecef_m: np.ndarray,
+    heading_deg: float,
+    pitch_deg: float,
+    roll_deg: float,
+    mounting_xyz_deg: np.ndarray,
+) -> np.ndarray:
+    """Build body->ECEF DCM with the same IE/SmartPNT convention used at initialization."""
+    lat, lon, _ = ecef_to_llh(position_ecef_m)
+    C_e_n = c_ecef_to_ned(lat, lon).T
+    heading, pitch, roll = np.deg2rad([heading_deg, pitch_deg, roll_deg])
+    ch, sh = np.cos(heading), np.sin(heading)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cr, sr = np.cos(roll), np.sin(roll)
+    C_n_f = np.array([
+        [cp * ch, sr * sp * ch - cr * sh, cr * sp * ch + sr * sh],
+        [cp * sh, sr * sp * sh + cr * ch, cr * sp * sh - sr * ch],
+        [-sp, sr * cp, cr * cp],
+    ])
+    C_f_v = np.array([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]])
+    C_b_v = c_vehicle_to_body_zxy(*mounting_xyz_deg)
+    return _rotation(C_e_n @ (C_n_f @ C_f_v) @ C_b_v.T)
+
+
+def attitude_error_state_target(prior_body_to_ecef: np.ndarray, truth_body_to_ecef: np.ndarray) -> np.ndarray:
+    """Error-state attitude correction consistent with inject_error_state()."""
+    relative = truth_body_to_ecef @ prior_body_to_ecef.T
+    rotvec = SpatialRotation.from_matrix(relative).as_rotvec()
+    return rotvec / ATTITUDE_FEEDBACK_SIGN
+
+
+# =============================================================================
+# TLE files
+# =============================================================================
+def read_tle_directory(path: str | Path, allow_non_tle_files: bool = True):
+    """Return validated (line1, line2) pairs from every file in the TLE folder."""
+    pairs = []
+    for source in sorted(Path(path).iterdir()):
+        if not source.is_file():
+            continue
+        lines = source.read_text(encoding="ascii", errors="replace").splitlines()
+        found = False
+        for i in range(len(lines) - 1):
+            line1, line2 = lines[i].strip(), lines[i + 1].strip()
+            if line1.startswith("1 ") and line2.startswith("2 "):
+                try:
+                    verify_checksum(line1, line2)
+                except ValueError:
+                    if allow_non_tle_files:
+                        continue
+                    raise
+                pairs.append((line1, line2))
+                found = True
+        if not found and not allow_non_tle_files:
+            raise ValueError(f"No valid TLE in {source}")
+    return pairs
+
+
+# =============================================================================
+# ECEF INS, TC MEASUREMENT MODEL, AND TLE/SGP4 LEO SIMULATION
+# =============================================================================
+Array = np.ndarray
+INS_STATE_DIM = 15
+# The available truth supervises position/velocity/attitude only. Biases remain
+# part of the propagated 15-state uncertainty model but are not measurement-updated
+# in either the classical history/warm-start or the learned online pass.
+NAVIGATION_CORRECTION_DIM = 9
+ATTITUDE_FEEDBACK_SIGN = -1.0
+J2_UNITLESS = 1.08262668e-3
+OMEGA_IE_E = np.array([0.0, 0.0, EARTH_ROTATION_RATE_RADPS])
+
+
+def _skew(v: Array) -> Array:
+    x, y, z = np.asarray(v, dtype=float).reshape(3)
+    return np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]])
+
+
+def _so3_exponential(rotation_vector_rad: Array) -> Array:
+    """Closed-form exp(skew(rotvec)) via Rodrigues, stable for tiny angles.
+
+    This is the exact SO(3) matrix exponential in closed form, not a reduced-order
+    navigation approximation.  It replaces the generic 3x3 scipy.linalg.expm calls.
+    """
+    v = np.asarray(rotation_vector_rad, dtype=float).reshape(3)
+    theta2 = float(v @ v)
+    K = _skew(v)
+    K2 = K @ K
+    if theta2 < 1e-12:
+        # Stable series for sin(theta)/theta and (1-cos(theta))/theta^2.
+        theta4 = theta2 * theta2
+        a = 1.0 - theta2 / 6.0 + theta4 / 120.0
+        b = 0.5 - theta2 / 24.0 + theta4 / 720.0
+    else:
+        theta = math.sqrt(theta2)
+        a = math.sin(theta) / theta
+        b = (1.0 - math.cos(theta)) / theta2
+    return np.eye(3) + a * K + b * K2
+
+
+OMEGA_IE_SKEW = _skew(OMEGA_IE_E)
+
+
+def _rotation(matrix: Array) -> Array:
+    """Project a numerically drifted DCM back to SO(3)."""
+    U, _, Vt = np.linalg.svd(np.asarray(matrix, dtype=float).reshape(3, 3))
+    R = U @ Vt
+    if np.linalg.det(R) < 0.0:
+        U[:, -1] *= -1.0
+        R = U @ Vt
+    return R
+
+
+@dataclass
+class NavigationState:
+    position_ecef_m: Array
+    velocity_ecef_mps: Array
+    body_to_ecef_dcm: Array
+    accelerometer_bias_body_mps2: Array = field(default_factory=lambda: np.zeros(3))
+    gyroscope_bias_body_radps: Array = field(default_factory=lambda: np.zeros(3))
+
+    def copy(self):
+        return NavigationState(
+            self.position_ecef_m.copy(),
+            self.velocity_ecef_mps.copy(),
+            self.body_to_ecef_dcm.copy(),
+            self.accelerometer_bias_body_mps2.copy(),
+            self.gyroscope_bias_body_radps.copy(),
+        )
+
+
+# Paper Eq. (8).  Current run uses zero scale/misalignment matrices and no
+# sample-wise stochastic-noise realization, but the complete compensation form
+# is retained through optional matrices.
+def compensate_imu(
+    measured_angular_rate_body_radps: Array,
+    measured_specific_force_body_mps2: Array,
+    gyroscope_bias_body_radps: Array,
+    accelerometer_bias_body_mps2: Array,
+    S_g: Array | None = None,
+    M_g: Array | None = None,
+    S_a: Array | None = None,
+    M_a: Array | None = None,
+) -> tuple[Array, Array]:
+    gyro_rhs = (
+        np.asarray(measured_angular_rate_body_radps, dtype=float)
+        - np.asarray(gyroscope_bias_body_radps, dtype=float)
+    )
+    accel_rhs = (
+        np.asarray(measured_specific_force_body_mps2, dtype=float)
+        - np.asarray(accelerometer_bias_body_mps2, dtype=float)
+    )
+
+    # Current project configuration has zero scale/misalignment matrices. Solving
+    # I*x=b millions of times is exactly equivalent to returning b directly.
+    if S_g is None and M_g is None:
+        gyro = gyro_rhs
+    else:
+        gyro = np.linalg.solve(
+            np.eye(3)
+            + (S_g if S_g is not None else 0.0)
+            + (M_g if M_g is not None else 0.0),
+            gyro_rhs,
+        )
+
+    if S_a is None and M_a is None:
+        accel = accel_rhs
+    else:
+        accel = np.linalg.solve(
+            np.eye(3)
+            + (S_a if S_a is not None else 0.0)
+            + (M_a if M_a is not None else 0.0),
+            accel_rhs,
+        )
+    return gyro, accel
+
+
+def _gravitation_j2_ecef(position_ecef_m: Array) -> Array:
+    x, y, z = np.asarray(position_ecef_m, dtype=float).reshape(3)
+    r = float(np.linalg.norm([x, y, z]))
+    z2_r2 = z * z / (r * r)
+    j2 = 1.5 * J2_UNITLESS * (EARTH_SEMI_MAJOR_AXIS_M / r) ** 2
+    xy_factor = 1.0 - j2 * (5.0 * z2_r2 - 1.0)
+    z_factor = 1.0 - j2 * (5.0 * z2_r2 - 3.0)
+    scale = -EARTH_GRAVITATIONAL_PARAMETER_M3PS2 / r**3
+    return scale * np.array([x * xy_factor, y * xy_factor, z * z_factor])
+
+
+def effective_gravity_ecef(position_ecef_m: Array) -> Array:
+    r = np.asarray(position_ecef_m, dtype=float).reshape(3)
+    return _gravitation_j2_ecef(r) - np.cross(OMEGA_IE_E, np.cross(OMEGA_IE_E, r))
+
+
+
+@lru_cache(maxsize=128)
+def _earth_rotation_transition(dt_s: float) -> Array:
+    """Exact closed-form Earth-rotation transition for repeated IMU step sizes."""
+    matrix = _so3_exponential(-OMEGA_IE_E * float(dt_s))
+    matrix.setflags(write=False)
+    return matrix
+
+def mechanize_ecef(
+    nav: NavigationState,
+    angular_rate_body_radps: Array,
+    specific_force_body_mps2: Array,
+    dt_s: float,
+) -> NavigationState:
+    """Standard ECEF strapdown INS completion used by the project."""
+    dt = float(dt_s)
+    C0 = nav.body_to_ecef_dcm
+    C1 = _rotation(
+        _earth_rotation_transition(dt)
+        @ C0
+        @ _so3_exponential(np.asarray(angular_rate_body_radps, dtype=float) * dt)
+    )
+    Cmid = 0.5 * (C0 + C1)
+    acceleration = (
+        Cmid @ np.asarray(specific_force_body_mps2)
+        + effective_gravity_ecef(nav.position_ecef_m)
+        - 2.0 * np.cross(OMEGA_IE_E, nav.velocity_ecef_mps)
+    )
+    velocity = nav.velocity_ecef_mps + acceleration * dt
+    position = nav.position_ecef_m + 0.5 * (nav.velocity_ecef_mps + velocity) * dt
+    return NavigationState(
+        position,
+        velocity,
+        C1,
+        nav.accelerometer_bias_body_mps2.copy(),
+        nav.gyroscope_bias_body_radps.copy(),
+    )
+
+
+def gnss_antenna_position(nav: NavigationState, lever_arm_b_m: Array) -> Array:
+    """Paper Eq. (9): IMU reference position -> GNSS antenna position."""
+    return nav.position_ecef_m + nav.body_to_ecef_dcm @ np.asarray(lever_arm_b_m).reshape(3)
+
+
+# =============================================================================
+# Pseudorange preparation
+# =============================================================================
+@dataclass(frozen=True)
+class PseudorangeMeasurement:
+    sat_id: str
+    constellation: str
+    pseudorange_m: float
+    satellite_position_reception_ecef_m: Array
+    satellite_clock_bias_s: float
+    ionosphere_delay_m: float
+    troposphere_delay_m: float
+    sigma_code_m: float
+    elevation_rad: float = float("nan")
+    cn0_dbhz: float | None = None
+
+
+def _iterate_transmit_time(
+    position_at,
+    sat_id: str,
+    reception_time_gpst_s: float,
+    receiver_position_ecef_m: Array,
+    initial_position_ecef_m: Array,
+    initial_transit_s: float,
+    epsilon_position_m: float,
+    max_iterations: int,
+):
+    previous_position = initial_position_ecef_m
+    transit_s = initial_transit_s
+    for _ in range(max_iterations):
+        transmit_time = reception_time_gpst_s - transit_s
+        position = position_at(sat_id, transmit_time)
+        rho, _, _ = geometric_range(receiver_position_ecef_m, position, transit_s)
+        if np.linalg.norm(position - previous_position) < epsilon_position_m:
+            return transmit_time, transit_s, position
+        previous_position = position
+        transit_s = rho / SPEED_OF_LIGHT_MPS
+    raise RuntimeError(f"Transmit-time iteration did not converge for {sat_id}")
+
+
+class GNSSPreprocessor:
+    def __init__(
+        self,
+        orbit: SP3Orbit,
+        clock: RINEXClock,
+        min_elevation_deg: float = 5.0,
+        use_troposphere: bool = True,
+        use_ionosphere: bool = True,
+        broadcast_ionosphere_coefficients: dict[str, tuple[Array, Array]] | None = None,
+    ):
+        self.orbit = orbit
+        self.clock = clock
+        self.clock_satellites = frozenset(clock.satellites)
+        self.min_elevation_rad = np.deg2rad(min_elevation_deg)
+        self.use_troposphere = use_troposphere
+        self.use_ionosphere = use_ionosphere
+        self.iono = broadcast_ionosphere_coefficients or {}
+
+    def _position(self, sat_id: str, time_gpst_s: float) -> np.ndarray:
+        return self.orbit.position(sat_id, time_gpst_s)
+
+    def _state(self, sat_id: str, time_gpst_s: float):
+        position_ecef_m = self._position(sat_id, time_gpst_s)
+        return position_ecef_m, self._clock_bias(sat_id, time_gpst_s)
+
+    def _clock_bias(self, sat_id: str, time_gpst_s: float) -> float:
+        """Return the same clock source without computing unused SP3 velocity."""
+        if sat_id in self.clock_satellites:
+            return float(self.clock.bias(sat_id, time_gpst_s))
+        clock_bias_s = self.orbit.clock_bias(sat_id, time_gpst_s)
+        if clock_bias_s is None:
+            raise KeyError(sat_id)
+        return float(clock_bias_s)
+
+    def prepare_measurement(
+        self,
+        reception_time_gpst_s: float,
+        raw: SatelliteMeasurement,
+        receiver_position_ecef_m: Array,
+        receiver_llh: tuple[float, float, float] | None = None,
+        c_ecef_ned: Array | None = None,
+    ) -> PseudorangeMeasurement | None:
+        try:
+            initial_position = self._position(raw.sat_id, reception_time_gpst_s)
+        except (KeyError, ValueError):
+            return None
+
+        initial_range, _, _ = geometric_range(receiver_position_ecef_m, initial_position, 0.0)
+        try:
+            transmit_time, transit_s, state_tx_position = _iterate_transmit_time(
+                self._position,
+                raw.sat_id,
+                reception_time_gpst_s,
+                receiver_position_ecef_m,
+                initial_position,
+                initial_range / SPEED_OF_LIGHT_MPS,
+                1e-4,
+                10,
+            )
+        except (KeyError, ValueError):
+            return None
+
+        satellite_clock_bias_s = self._clock_bias(raw.sat_id, transmit_time)
+        rho, los, satellite_position_rx = geometric_range(
+            receiver_position_ecef_m, state_tx_position, transit_s
+        )
+        if receiver_llh is None:
+            receiver_llh = ecef_to_llh(receiver_position_ecef_m)
+        if c_ecef_ned is None:
+            c_ecef_ned = c_ecef_to_ned(receiver_llh[0], receiver_llh[1])
+        elevation, azimuth = elevation_azimuth_from_ned_matrix(c_ecef_ned, los)
+        if elevation < self.min_elevation_rad:
+            return None
+
+        ionosphere = 0.0
+        height_m = None
+        if self.use_ionosphere:
+            alpha, beta = self.iono[raw.constellation]
+            tow = gpst_seconds_to_week_tow(reception_time_gpst_s).tow_s
+            if raw.constellation == "G":
+                reference_frequency_hz = 1575.42e6
+            else:  # Current allowed constellation is BDS.
+                # BDS broadcast coefficients used here are B1I coefficients.
+                if raw.signal.suffix not in {"2I", "2X", "1I", "1X"}:
+                    return None
+                tow = (tow - 14.0) % 604800.0
+                reference_frequency_hz = 1561.098e6
+            lat, lon, height_m = receiver_llh
+            ionosphere = klobuchar_delay_m(
+                tow, lat, lon, elevation, azimuth, alpha, beta
+            ) * (reference_frequency_hz / raw.signal.frequency_hz) ** 2
+
+        troposphere = 0.0
+        if self.use_troposphere:
+            if height_m is None:
+                height_m = receiver_llh[2]
+            troposphere = saastamoinen_delay_m(height_m, elevation)
+
+        return PseudorangeMeasurement(
+            raw.sat_id,
+            raw.constellation,
+            float(raw.pseudorange_m),
+            satellite_position_rx,
+            satellite_clock_bias_s,
+            float(ionosphere),
+            float(troposphere),
+            5.0,  # GNSS R weighting remains a declared project completion; Yan et al. use real GNSS data.
+            float(elevation),
+            raw.cn0_dbhz,
+        )
+
+    def prepare_epoch(
+        self,
+        epoch: ObservationEpoch,
+        nav: NavigationState,
+        lever_arm_b_m: Array,
+    ) -> tuple[PseudorangeMeasurement, ...]:
+        antenna_position = gnss_antenna_position(nav, lever_arm_b_m)
+        receiver_llh = ecef_to_llh(antenna_position)
+        c_ecef_ned = c_ecef_to_ned(receiver_llh[0], receiver_llh[1])
+        out = []
+        for raw in epoch.measurements:
+            measurement = self.prepare_measurement(
+                epoch.time_gpst_s,
+                raw,
+                antenna_position,
+                receiver_llh=receiver_llh,
+                c_ecef_ned=c_ecef_ned,
+            )
+            if measurement is not None:
+                out.append(measurement)
+        return tuple(out)
+
+
+# =============================================================================
+# 15-state error dynamics / KF
+# =============================================================================
+def build_error_state_dynamics(nav: NavigationState, specific_force_body_mps2: Array) -> Array:
+    """Paper Eq. (6)/(7), with signs matched to this file's feedback convention.
+
+    ``inject_error_state`` applies attitude feedback with
+    ``ATTITUDE_FEEDBACK_SIGN = -1`` and adds the estimated accelerometer bias to
+    the nominal bias state. Under that convention, the velocity-error coupling
+    from attitude and accelerometer-bias errors has the signs used below.
+    """
+    F = np.zeros((INS_STATE_DIM, INS_STATE_DIM))
+    r_e = nav.position_ecef_m
+    radius = float(np.linalg.norm(r_e))
+    gravity = _gravitation_j2_ecef(r_e)
+    radial = r_e / radius
+    C = nav.body_to_ecef_dcm
+    F[0:3, 3:6] = np.eye(3)
+    F[3:6, 0:3] = -(2.0 / radius) * np.outer(gravity, radial)
+    F[3:6, 3:6] = -2.0 * OMEGA_IE_SKEW
+    F[3:6, 6:9] = _skew(C @ np.asarray(specific_force_body_mps2))
+    F[3:6, 9:12] = -C
+    F[6:9, 6:9] = -OMEGA_IE_SKEW
+    F[6:9, 12:15] = C
+    return F
+
+
+def initial_covariance_from_imu_model(model: IMUNoiseModelSI) -> Array:
+    sigma = np.concatenate([
+        model.isdv_pos_m,
+        model.isdv_vel_mps,
+        model.isdv_att_rad,
+        model.isdv_accel_bias_mps2,
+        model.isdv_gyro_bias_rad_s,
+    ])
+    return np.diag(sigma**2)
+
+
+def continuous_process_covariance_from_imu_model(model: IMUNoiseModelSI) -> Array:
+    density = np.concatenate([
+        model.pnsd_pos_m_sqrt_s,
+        model.pnsd_vel_mps_sqrt_s,
+        model.pnsd_att_rad_sqrt_s,
+        model.pnsd_accel_bias_mps2_sqrt_s,
+        model.pnsd_gyro_bias_rad_s_sqrt_s,
+    ])
+    return np.diag(density**2)
+
+
+_VAN_LOAN_STATS = {
+    "taylor_calls": 0,
+    "exact_fallback_calls": 0,
+    "validation_calls": 0,
+    "max_norm_1": 0.0,
+    "max_taylor_remainder_bound": 0.0,
+    "max_validation_phi_abs": 0.0,
+    "max_validation_qd_abs": 0.0,
+}
+
+
+def _matrix_exponential_taylor(matrix: Array, order: int) -> Array:
+    """Evaluate exp(matrix) by a fixed-order Taylor series in float64."""
+    B = np.asarray(matrix, dtype=float)
+    E = np.eye(B.shape[0], dtype=float)
+    term = np.eye(B.shape[0], dtype=float)
+    for k in range(1, int(order) + 1):
+        term = (term @ B) / float(k)
+        E += term
+    return E
+
+
+def discretize_process_noise_van_loan(F: Array, Qc: Array, dt_s: float) -> tuple[Array, Array]:
+    """Van Loan discretization with guarded fast exponential evaluation.
+
+    For the normal high-rate IMU regime, ||A*dt||_1 is small and a 10th-order
+    Taylor series is much cheaper than a general-purpose 30x30 matrix exponential.
+    The fast path is used only below VAN_LOAN_TAYLOR_MAX_NORM_1.  Otherwise the
+    original scipy.linalg.expm path is retained exactly.
+    """
+    A = np.zeros((30, 30), dtype=float)
+    A[:15, :15] = F
+    A[:15, 15:] = Qc
+    A[15:, 15:] = -F.T
+    B = A * float(dt_s)
+
+    norm_1 = float(np.linalg.norm(B, 1))
+    _VAN_LOAN_STATS["max_norm_1"] = max(_VAN_LOAN_STATS["max_norm_1"], norm_1)
+
+    if norm_1 <= VAN_LOAN_TAYLOR_MAX_NORM_1:
+        E = _matrix_exponential_taylor(B, VAN_LOAN_TAYLOR_ORDER)
+        _VAN_LOAN_STATS["taylor_calls"] += 1
+
+        # Conservative submultiplicative-norm remainder estimate for the matrix
+        # exponential Taylor tail.  This is diagnostic only and does not alter E.
+        remainder_bound = (
+            math.exp(norm_1)
+            * norm_1 ** (VAN_LOAN_TAYLOR_ORDER + 1)
+            / math.factorial(VAN_LOAN_TAYLOR_ORDER + 1)
+        )
+        _VAN_LOAN_STATS["max_taylor_remainder_bound"] = max(
+            _VAN_LOAN_STATS["max_taylor_remainder_bound"],
+            float(remainder_bound),
+        )
+
+        # A handful of exact comparisons provide an in-run numerical regression
+        # check while adding negligible cost compared with tens of thousands of calls.
+        if _VAN_LOAN_STATS["validation_calls"] < VAN_LOAN_VALIDATE_CALLS:
+            E_ref = expm(B)
+            Phi_fast = E[:15, :15]
+            Qd_fast = E[:15, 15:] @ Phi_fast.T
+            Phi_ref = E_ref[:15, :15]
+            Qd_ref = E_ref[:15, 15:] @ Phi_ref.T
+            _VAN_LOAN_STATS["max_validation_phi_abs"] = max(
+                _VAN_LOAN_STATS["max_validation_phi_abs"],
+                float(np.max(np.abs(Phi_fast - Phi_ref))),
+            )
+            _VAN_LOAN_STATS["max_validation_qd_abs"] = max(
+                _VAN_LOAN_STATS["max_validation_qd_abs"],
+                float(np.max(np.abs(Qd_fast - Qd_ref))),
+            )
+            _VAN_LOAN_STATS["validation_calls"] += 1
+    else:
+        E = expm(B)
+        _VAN_LOAN_STATS["exact_fallback_calls"] += 1
+
+    Phi = E[:15, :15]
+    Qd = E[:15, 15:] @ Phi.T
+    return Phi, 0.5 * (Qd + Qd.T)
+
+
+@dataclass(frozen=True)
+class TCMeasurementModel:
+    y: Array
+    y_pred: Array
+    innovation: Array
+    H: Array
+    R: Array
+    sat_ids: tuple[str, ...]
+    receiver_clock_bias_m_by_system: dict[str, float]
+
+
+def predict_pseudorange(
+    antenna_position_ecef_m: Array,
+    measurement: PseudorangeMeasurement,
+    receiver_clock_bias_m_by_system: dict[str, float],
+) -> tuple[float, Array]:
+    range_vector = np.asarray(antenna_position_ecef_m) - measurement.satellite_position_reception_ecef_m
+    geometric_range = float(np.linalg.norm(range_vector))
+    los = range_vector / geometric_range
+
+    # Current project: LEO receiver clock is ideal zero. GPS/BDS clocks are
+    # epoch-wise nuisance parameters eliminated from the measurement equations.
+    receiver_clock_m = (
+        0.0
+        if measurement.constellation == "L"
+        else float(receiver_clock_bias_m_by_system.get(measurement.constellation, 0.0))
+    )
+
+    predicted = (
+        geometric_range
+        + receiver_clock_m
+        - SPEED_OF_LIGHT_MPS * measurement.satellite_clock_bias_s
+        + measurement.ionosphere_delay_m
+        + measurement.troposphere_delay_m
+    )
+    return float(predicted), los
+
+
+def retain_clock_observable_measurements(measurements) -> tuple[PseudorangeMeasurement, ...]:
+    """Drop a lone GPS/BDS pseudorange whose unknown receiver clock absorbs it fully.
+
+    One unknown receiver-clock nuisance is eliminated independently for GPS and
+    BDS at every epoch. A constellation represented by only one pseudorange has
+    zero position-information degrees of freedom after that elimination. LEO uses
+    the project's ideal-zero receiver clock and is therefore unaffected.
+    """
+    measurements = tuple(measurements)
+    counts = Counter(
+        m.constellation
+        for m in measurements
+        if m.constellation in {"G", "C"}
+    )
+    return tuple(
+        m
+        for m in measurements
+        if m.constellation not in {"G", "C"} or counts[m.constellation] >= 2
+    )
+
+
+def estimate_receiver_clock_biases_wls_m(
+    nav: NavigationState,
+    measurements,
+    lever_arm_b_m: Array,
+) -> dict[str, float]:
+    """Estimate one epoch-wise WLS receiver-clock nuisance for GPS and for BDS."""
+    antenna = gnss_antenna_position(nav, lever_arm_b_m)
+    grouped = {"G": [], "C": []}
+    zero_clock = {"G": 0.0, "C": 0.0}
+    for m in measurements:
+        if m.constellation not in grouped:
+            continue
+        predicted, _ = predict_pseudorange(antenna, m, zero_clock)
+        variance = float(m.sigma_code_m) ** 2
+        if not math.isfinite(variance) or variance <= 0.0:
+            raise ValueError("GNSS pseudorange variance must be finite and positive")
+        grouped[m.constellation].append(
+            (m.pseudorange_m - predicted, 1.0 / variance)
+        )
+
+    out: dict[str, float] = {}
+    for system, samples in grouped.items():
+        if not samples:
+            continue
+        residual, weight = np.asarray(samples, dtype=float).T
+        out[system] = float(np.sum(weight * residual) / np.sum(weight))
+    return out
+
+
+def _clock_projector_and_biases(
+    measurements,
+    variances: Array,
+    raw_innovation: Array,
+) -> tuple[Array, dict[str, float]]:
+    n = len(measurements)
+    projector = np.eye(n)
+    receiver_clock: dict[str, float] = {}
+    for system in ("G", "C"):
+        index = np.asarray(
+            [i for i, m in enumerate(measurements) if m.constellation == system],
+            dtype=int,
+        )
+        if index.size == 0:
+            continue
+        if index.size < 2:
+            raise RuntimeError(
+                f"{system} receiver-clock elimination requires at least two measurements"
+            )
+        weights = 1.0 / variances[index]
+        weight_sum = np.sum(weights)
+        normalized_weight = weights / weight_sum
+        receiver_clock[system] = float(
+            np.sum(weights * raw_innovation[index]) / weight_sum
+        )
+        block = (
+            np.eye(index.size)
+            - np.ones((index.size, 1)) @ normalized_weight[None, :]
+        )
+        projector[np.ix_(index, index)] = block
+    return projector, receiver_clock
+
+
+def build_measurement_model(
+    nav: NavigationState,
+    measurements,
+    lever_arm_b_m: Array,
+) -> TCMeasurementModel:
+    """Build the 15-state pseudorange model with clock-nuisance projection.
+
+    Runtime optimization: zero-clock pseudorange predictions are evaluated once.
+    The WLS receiver-clock estimate is then obtained from those same raw
+    innovations and variances instead of repeating the prediction loop.
+    """
+    measurements = retain_clock_observable_measurements(measurements)
+    n = len(measurements)
+    if n == 0:
+        return TCMeasurementModel(
+            np.empty(0),
+            np.empty(0),
+            np.empty(0),
+            np.zeros((0, INS_STATE_DIM)),
+            np.zeros((0, 0)),
+            (),
+            {},
+        )
+
+    y = np.empty(n)
+    y_pred_zero_clock = np.empty(n)
+    H_raw = np.zeros((n, INS_STATE_DIM))
+    variances = np.empty(n)
+    lever_e = nav.body_to_ecef_dcm @ np.asarray(lever_arm_b_m).reshape(3)
+    antenna_position = nav.position_ecef_m + lever_e
+    lever_skew = _skew(lever_e)
+    sat_ids: list[str] = []
+
+    zero_clock = {"G": 0.0, "C": 0.0}
+    for i, m in enumerate(measurements):
+        y_pred_zero_clock[i], los = predict_pseudorange(
+            antenna_position, m, zero_clock
+        )
+        y[i] = m.pseudorange_m
+        H_raw[i, 0:3] = los
+        H_raw[i, 6:9] = -ATTITUDE_FEEDBACK_SIGN * (los @ lever_skew)
+        variance = float(m.sigma_code_m) ** 2
+        if not math.isfinite(variance) or variance <= 0.0:
+            raise ValueError("pseudorange variance must be finite and positive")
+        variances[i] = variance
+        sat_ids.append(m.sat_id)
+
+    raw_innovation = y - y_pred_zero_clock
+    projector, receiver_clock = _clock_projector_and_biases(
+        measurements, variances, raw_innovation
+    )
+
+    innovation = projector @ raw_innovation
+    H = projector @ H_raw
+    R_raw = np.diag(variances)
+    R = projector @ R_raw @ projector.T
+    R = 0.5 * (R + R.T)
+
+    y_pred = y.copy() - innovation
+    return TCMeasurementModel(
+        y,
+        y_pred,
+        innovation,
+        H,
+        R,
+        tuple(sat_ids),
+        receiver_clock,
+    )
+
+
+def build_innovation_only(
+    nav: NavigationState,
+    measurements,
+    lever_arm_b_m: Array,
+) -> Array:
+    """Recompute posterior innovation without constructing unused H/R matrices."""
+    measurements = retain_clock_observable_measurements(measurements)
+    n = len(measurements)
+    if n == 0:
+        return np.empty(0)
+
+    antenna_position = gnss_antenna_position(nav, lever_arm_b_m)
+    zero_clock = {"G": 0.0, "C": 0.0}
+    raw_innovation = np.empty(n)
+    variances = np.empty(n)
+    for i, m in enumerate(measurements):
+        predicted, _ = predict_pseudorange(antenna_position, m, zero_clock)
+        raw_innovation[i] = m.pseudorange_m - predicted
+        variance = float(m.sigma_code_m) ** 2
+        if not math.isfinite(variance) or variance <= 0.0:
+            raise ValueError("pseudorange variance must be finite and positive")
+        variances[i] = variance
+
+    projector, _ = _clock_projector_and_biases(
+        measurements, variances, raw_innovation
+    )
+    return projector @ raw_innovation
+
+
+def kalman_measurement_update(P: Array, innovation: Array, H: Array, R: Array):
+    """Classical history/warm-start update consistent with the learned 9-row policy.
+
+    The GPS/BDS clock projection makes S singular in the removed clock directions,
+    so a Moore-Penrose inverse is required. Bias gain rows are forced to zero so
+    the classical history and warm-start use the same nominal bias policy as the
+    learned online pass; the full 15-state covariance is still propagated.
+    """
+    PHt = P @ H.T
+    S = H @ PHt + R
+    S = 0.5 * (S + S.T)
+    K = PHt @ np.linalg.pinv(S, rcond=1e-12)
+
+    # No accelerometer/gyro bias truth is available for the learned model. Keep
+    # nominal bias estimates frozen in both classical and learned measurement
+    # updates instead of creating a train/test bias-state mismatch.
+    K[NAVIGATION_CORRECTION_DIM:, :] = 0.0
+
+    dx = K @ innovation
+    I_KH = np.eye(INS_STATE_DIM) - K @ H
+    P_post = I_KH @ P @ I_KH.T + K @ R @ K.T
+    return dx, 0.5 * (P_post + P_post.T), K
+
+
+def learned_gain_covariance_update(
+    prior_covariance: Array,
+    learned_gain: Array,
+    measurement_jacobian: Array,
+    measurement_covariance: Array,
+) -> Array:
+    """Joseph covariance bookkeeping for a KalmanNet-produced gain.
+
+    IMPORTANT:
+    - The Masked CLA does NOT use ``R`` to compute its Kalman gain.
+    - The navigation correction remains ``dx = K_net @ innovation``.
+    - ``R`` appears here only to propagate a covariance estimate for diagnostics
+      and future FDE/integrity work. Yan et al. do not publish an explicit
+      learned-gain covariance-update equation, so this is a declared
+      STANDARD-COMPLETION rather than a paper-exact step.
+    """
+    prior_covariance = np.asarray(prior_covariance, dtype=float)
+    learned_gain = np.asarray(learned_gain, dtype=float)
+    measurement_jacobian = np.asarray(measurement_jacobian, dtype=float)
+    measurement_covariance = np.asarray(measurement_covariance, dtype=float)
+
+    measurement_count = measurement_jacobian.shape[0]
+    if (
+        prior_covariance.shape != (INS_STATE_DIM, INS_STATE_DIM)
+        or measurement_jacobian.ndim != 2
+        or measurement_jacobian.shape[1] != INS_STATE_DIM
+        or learned_gain.shape != (INS_STATE_DIM, measurement_count)
+        or measurement_covariance.shape != (measurement_count, measurement_count)
+    ):
+        raise ValueError("inconsistent P/K/H/R dimensions in learned covariance update")
+
+    if (
+        not np.all(np.isfinite(prior_covariance))
+        or not np.all(np.isfinite(learned_gain))
+        or not np.all(np.isfinite(measurement_jacobian))
+        or not np.all(np.isfinite(measurement_covariance))
+    ):
+        raise ValueError("non-finite P/K/H/R in learned covariance update")
+
+    update_matrix = np.eye(INS_STATE_DIM) - learned_gain @ measurement_jacobian
+    posterior_covariance = (
+        update_matrix @ prior_covariance @ update_matrix.T
+        + learned_gain @ measurement_covariance @ learned_gain.T
+    )
+    return 0.5 * (posterior_covariance + posterior_covariance.T)
+
+
+def inject_error_state(nav: NavigationState, dx: Array) -> NavigationState:
+    dx = np.asarray(dx, dtype=float).reshape(15)
+    out = nav.copy()
+    out.position_ecef_m += dx[0:3]
+    out.velocity_ecef_mps += dx[3:6]
+    out.body_to_ecef_dcm = _rotation(
+        _so3_exponential(ATTITUDE_FEEDBACK_SIGN * dx[6:9])
+        @ out.body_to_ecef_dcm
+    )
+    out.accelerometer_bias_body_mps2 += dx[9:12]
+    out.gyroscope_bias_body_radps += dx[12:15]
+    return out
+
+
+# =============================================================================
+# TLE/SGP4 LEO orbit and pseudorange-only simulation
+# =============================================================================
+@dataclass(frozen=True)
+class _TLEElement:
+    epoch_gpst_s: float
+    satrec: Satrec
+
+
+@dataclass(frozen=True)
+class LEOSatelliteState:
+    position_ecef_m: Array
+    velocity_ecef_mps: Array
+
+
+
+@lru_cache(maxsize=8192)
+def _gpst_to_utc_time_cached(time_gpst_s: float) -> Time:
+    """Cache repeated receive-epoch GPST->UTC conversions used by all LEOs."""
+    return Time(float(time_gpst_s), format="gps").utc
+
+class TLESGP4Provider:
+    """Approximate LEO orbit source: TLE + SGP4/WGS-72 + TEME->ITRS/ECEF."""
+    def __init__(
+        self,
+        path: str | Path,
+        max_tle_age_days: float,
+        allow_degraded_eop: bool = False,
+        allow_non_tle_files: bool = True,
+    ):
+        self.max_tle_age_s = float(max_tle_age_days) * 86400.0
+        self.allow_degraded_eop = allow_degraded_eop
+        by_id = {}
+        for line1, line2 in read_tle_directory(path, allow_non_tle_files):
+            satrec = Satrec.twoline2rv(line1, line2, WGS72)
+            norad = str(satrec.satnum_str).strip()
+            epoch = Time(satrec.jdsatepoch, satrec.jdsatepochF, format="jd", scale="utc")
+            by_id.setdefault(f"NORAD-{norad}", []).append(
+                _TLEElement(float(epoch.gps), satrec)
+            )
+        self._elements = {
+            sat_id: tuple(sorted(elements, key=lambda e: e.epoch_gpst_s))
+            for sat_id, elements in by_id.items()
+        }
+        self._element_times = {
+            sat_id: tuple(element.epoch_gpst_s for element in elements)
+            for sat_id, elements in self._elements.items()
+        }
+        self.satellite_ids = tuple(
+            sorted(self._elements, key=lambda s: int(s.split("-")[1]))
+        )
+
+    def state_at(self, time_gpst_s: float, sat_id: str) -> LEOSatelliteState:
+        elements = self._elements[sat_id]
+        index = bisect_right(self._element_times[sat_id], time_gpst_s) - 1
+        if index < 0:
+            raise ValueError(f"No prior TLE for {sat_id}")
+        element = elements[index]
+        if time_gpst_s - element.epoch_gpst_s > self.max_tle_age_s:
+            raise ValueError(f"TLE too old for {sat_id}")
+
+        utc = _gpst_to_utc_time_cached(float(time_gpst_s))
+        error, position_km, velocity_km_s = element.satrec.sgp4(float(utc.jd1), float(utc.jd2))
+        if error:
+            raise ValueError(SGP4_ERRORS.get(error, f"SGP4 error {error}"))
+
+        position = CartesianRepresentation(np.asarray(position_km) * u.km)
+        velocity = CartesianDifferential(np.asarray(velocity_km_s) * u.km / u.s)
+        teme = TEME(position.with_differentials(velocity), obstime=utc)
+        degraded = "warn" if self.allow_degraded_eop else "error"
+        with iers.conf.set_temp("auto_download", False), iers.conf.set_temp("iers_degraded_accuracy", degraded):
+            itrs = teme.transform_to(ITRS(obstime=utc))
+        return LEOSatelliteState(
+            np.asarray(itrs.cartesian.xyz.to_value(u.m)).reshape(3),
+            np.asarray(itrs.cartesian.differentials["s"].d_xyz.to_value(u.m / u.s)).reshape(3),
+        )
+
+
+def ref35_ionosphere_sigma_m(elevation_rad: float, receiver_latitude_rad: float) -> float:
+    """Ref. [35], Eqs. (15)-(16): 1-sigma ionospheric residual error [m]."""
+    latitude_deg = abs(float(np.rad2deg(receiver_latitude_rad)))
+    if latitude_deg <= 20.0:
+        sigma_vertical_m = 9.0
+    elif latitude_deg <= 55.0:
+        sigma_vertical_m = 4.5
+    else:
+        sigma_vertical_m = 6.0
+    earth_mean_radius_m = 6_378_140.0
+    ionosphere_mean_height_m = 350_000.0
+    mapping_denominator = 1.0 - (
+        earth_mean_radius_m * math.cos(float(elevation_rad))
+        / (earth_mean_radius_m + ionosphere_mean_height_m)
+    ) ** 2
+    return float(sigma_vertical_m / math.sqrt(max(mapping_denominator, 1e-15)))
+
+
+def ref35_troposphere_sigma_m(elevation_rad: float) -> float:
+    """Ref. [35], Eq. (17): Black-Eisner mapped 1-sigma tropo error [m]."""
+    mapping = 1.001 / math.sqrt(0.002001 + math.sin(float(elevation_rad)) ** 2)
+    return float(mapping * 0.12)
+
+
+def ref35_multipath_sigma_m(elevation_rad: float) -> float:
+    """Ref. [35], Eq. (18): elevation-dependent multipath 1-sigma error [m].
+
+    The equation in Ref. [35] is
+        sigma_mp = 0.13 + 0.53 * exp(-psi / 10),
+    where psi is the satellite elevation angle in degrees.
+
+    Ref. [35] models multipath, not NLOS separately. In this project this term is
+    used as the requested MP/NLOS stochastic-error model. Receiver noise is not
+    modeled.
+    """
+    elevation_deg = float(np.rad2deg(elevation_rad))
+    if not math.isfinite(elevation_deg):
+        raise ValueError("finite elevation is required")
+    if elevation_deg < 0.0:
+        raise ValueError("multipath model requires a nonnegative elevation angle")
+    return float(0.13 + 0.53 * math.exp(-elevation_deg / 10.0))
+
+
+class LEODownlinkSimulator:
+    """Yan et al. Eqs. (1)-(5) with TLE/SGP4 orbit and ideal LEO clocks.
+
+    Ref. [35] supplies ionospheric, tropospheric, and multipath residual-error
+    standard deviations. URA and receiver noise are intentionally omitted.
+
+    The source papers specify standard deviations but do not publish a unique
+    stochastic sampling law for these residuals. This implementation therefore
+    uses independent zero-mean Gaussian realizations as an explicit simulation
+    assumption. The same component variances are summed to form sigma_code_m,
+    making the simulated residual covariance and R internally consistent.
+    """
+    def __init__(
+        self,
+        provider: TLESGP4Provider,
+        klobuchar_coefficients: tuple[Array, Array] | None,
+        seed: int = 0,
+        tx_epsilon_position_m: float = 1e-3,
+        tx_max_iterations: int = 20,
+        minimum_elevation_deg: float = 10.0,
+        prefilter_guard_deg: float = LEO_PREFILTER_GUARD_DEG,
+        use_ionosphere: bool = True,
+        use_troposphere: bool = True,
+    ):
+        self.provider = provider
+        self.klobuchar_coefficients = klobuchar_coefficients
+        self.tx_epsilon_position_m = float(tx_epsilon_position_m)
+        self.tx_max_iterations = int(tx_max_iterations)
+        self.minimum_elevation_rad = np.deg2rad(minimum_elevation_deg)
+        self.prefilter_guard_rad = np.deg2rad(float(prefilter_guard_deg))
+        if self.prefilter_guard_rad < 0.0:
+            raise ValueError("LEO prefilter guard must be nonnegative")
+        self.use_ionosphere = bool(use_ionosphere)
+        self.use_troposphere = bool(use_troposphere)
+        self.prefilter_checked = 0
+        self.prefilter_rejected = 0
+        self.prefilter_passed = 0
+        # Reproducible independent residual draws for the Ref. [35] sigma models.
+        self.rng = np.random.default_rng(seed)
+
+    def _paper_ionosphere_delay_m(
+        self,
+        receive_time_gpst_s: float,
+        receiver_position_ecef_m: Array,
+        satellite_position_reception_ecef_m: Array,
+        elevation_rad: float,
+        azimuth_rad: float,
+        receiver_llh: tuple[float, float, float] | None = None,
+    ) -> tuple[float, float]:
+        if not self.use_ionosphere:
+            return 0.0, 0.0
+        if self.klobuchar_coefficients is None:
+            raise ValueError("Klobuchar coefficients are required for Yan et al. Eq. (2)")
+        alpha, beta = self.klobuchar_coefficients
+        if receiver_llh is None:
+            receiver_llh = ecef_to_llh(receiver_position_ecef_m)
+        lat, lon, _ = receiver_llh
+        tow = gpst_seconds_to_week_tow(receive_time_gpst_s).tow_s
+        iklo_m = klobuchar_delay_m(tow, lat, lon, elevation_rad, azimuth_rad, alpha, beta)
+        _, _, satellite_height_m = ecef_to_llh(satellite_position_reception_ecef_m)
+        if satellite_height_m >= LEO_IONOSPHERE_UPPER_HEIGHT_M:
+            scale = 1.0
+        elif satellite_height_m <= LEO_IONOSPHERE_LOWER_HEIGHT_M:
+            scale = 0.0
+        else:
+            scale = (
+                (satellite_height_m - LEO_IONOSPHERE_LOWER_HEIGHT_M)
+                / (LEO_IONOSPHERE_UPPER_HEIGHT_M - LEO_IONOSPHERE_LOWER_HEIGHT_M)
+            )
+        return float(scale * iklo_m), float(scale)
+
+    def simulate_one(
+        self,
+        receive_time_gpst_s: float,
+        receiver_position_ecef_m: Array,
+        sat_id: str,
+        receiver_llh: tuple[float, float, float] | None = None,
+        c_ecef_ned: Array | None = None,
+    ):
+        if receiver_llh is None:
+            receiver_llh = ecef_to_llh(receiver_position_ecef_m)
+        if c_ecef_ned is None:
+            c_ecef_ned = c_ecef_to_ned(receiver_llh[0], receiver_llh[1])
+
+        initial_state = self.provider.state_at(receive_time_gpst_s, sat_id)
+        initial_range, initial_los, _ = geometric_range(
+            receiver_position_ecef_m, initial_state.position_ecef_m, 0.0
+        )
+        initial_elevation, _ = elevation_azimuth_from_ned_matrix(
+            c_ecef_ned, initial_los
+        )
+        self.prefilter_checked += 1
+        if initial_elevation < self.minimum_elevation_rad - self.prefilter_guard_rad:
+            self.prefilter_rejected += 1
+            return None
+        self.prefilter_passed += 1
+
+        transmit_time, transit_s, state_tx_position = _iterate_transmit_time(
+            lambda sid, t: self.provider.state_at(t, sid).position_ecef_m,
+            sat_id,
+            receive_time_gpst_s,
+            receiver_position_ecef_m,
+            initial_state.position_ecef_m,
+            initial_range / SPEED_OF_LIGHT_MPS,
+            self.tx_epsilon_position_m,
+            self.tx_max_iterations,
+        )
+        rho, los, sat_rx = geometric_range(
+            receiver_position_ecef_m, state_tx_position, transit_s
+        )
+        elevation, azimuth = elevation_azimuth_from_ned_matrix(c_ecef_ned, los)
+        if elevation < self.minimum_elevation_rad:
+            return None
+
+        receiver_lat, _, receiver_height_m = receiver_llh
+
+        # Yan et al. Eq. (2): Klobuchar above the ionosphere, linearly weighted
+        # by satellite height when the LEO is inside the ionosphere.
+        ionosphere_m, ionosphere_path_scale = self._paper_ionosphere_delay_m(
+            receive_time_gpst_s,
+            receiver_position_ecef_m,
+            sat_rx,
+            elevation,
+            azimuth,
+            receiver_llh=receiver_llh,
+        )
+
+        # Yan et al.: troposphere can be mitigated/modelled as in traditional
+        # GNSS. The project already uses a standard Saastamoinen delay model.
+        troposphere_m = (
+            saastamoinen_delay_m(receiver_height_m, elevation)
+            if self.use_troposphere
+            else 0.0
+        )
+
+        # Residual-error standard deviations. Ref. [35] defines these as
+        # pseudorange estimation-error sigmas, not as the deterministic modeled
+        # atmospheric delays themselves. The LEO-height factor follows Yan et al.
+        # Eq. (2) for the ionospheric path inside the ionosphere.
+        iono_sigma_m = (
+            ionosphere_path_scale * ref35_ionosphere_sigma_m(elevation, receiver_lat)
+            if self.use_ionosphere
+            else 0.0
+        )
+        tropo_sigma_m = (
+            ref35_troposphere_sigma_m(elevation)
+            if self.use_troposphere
+            else 0.0
+        )
+
+        # User-requested simplification: Ref. [35], Eq. (18), supplies the
+        # elevation-dependent multipath sigma. Ref. [35] does not model NLOS
+        # separately, so this term is used as the combined MP/NLOS simplification.
+        mp_sigma_m = ref35_multipath_sigma_m(elevation)
+
+        # Yan et al. Eq. (3) motivates summing component variances. URA and
+        # receiver-noise terms are intentionally omitted in this project.
+        #
+        # The references provide sigma models but not a unique sampling
+        # distribution. Independent N(0, sigma^2) realizations are therefore an
+        # explicit simulation assumption. Injecting the same three components
+        # whose variances form R removes the previous inconsistency in which
+        # ionosphere/troposphere variances were present in R but no corresponding
+        # stochastic residuals appeared in the simulated pseudorange.
+        ionosphere_residual_m = float(self.rng.normal(0.0, iono_sigma_m)) if iono_sigma_m > 0.0 else 0.0
+        troposphere_residual_m = float(self.rng.normal(0.0, tropo_sigma_m)) if tropo_sigma_m > 0.0 else 0.0
+        mp_nlos_error_m = float(self.rng.normal(0.0, mp_sigma_m)) if mp_sigma_m > 0.0 else 0.0
+
+        total_variance_m2 = (
+            iono_sigma_m**2
+            + tropo_sigma_m**2
+            + mp_sigma_m**2
+        )
+        sigma_code_m = math.sqrt(max(total_variance_m2, 1e-12))
+
+        # Yan et al. Eq. (1), with ideal LEO receiver/satellite clock terms.
+        # The modeled ionosphere/troposphere terms are also used by the predictor;
+        # only their stochastic residual errors remain in the innovation.
+        pseudorange_m = (
+            rho
+            + ionosphere_m
+            + troposphere_m
+            + ionosphere_residual_m
+            + troposphere_residual_m
+            + mp_nlos_error_m
+        )
+        return PseudorangeMeasurement(
+            sat_id,
+            "L",
+            float(pseudorange_m),
+            sat_rx,
+            0.0,
+            float(ionosphere_m),
+            float(troposphere_m),
+            float(sigma_code_m),
+            float(elevation),
+            None,
+        )
+
+    def simulate_epoch(self, receive_time_gpst_s: float, receiver_position_ecef_m: Array):
+        receiver_llh = ecef_to_llh(receiver_position_ecef_m)
+        c_ecef_ned = c_ecef_to_ned(receiver_llh[0], receiver_llh[1])
+        measurements = []
+        for sat_id in self.provider.satellite_ids:
+            try:
+                measurement = self.simulate_one(
+                    receive_time_gpst_s,
+                    receiver_position_ecef_m,
+                    sat_id,
+                    receiver_llh=receiver_llh,
+                    c_ecef_ned=c_ecef_ned,
+                )
+            except ValueError:
+                continue
+            if measurement is not None:
+                measurements.append(measurement)
+        return tuple(measurements)
+
+
+# =============================================================================
+# MASKED CLA NETWORK
+# =============================================================================
+# Paper-supported architecture:
+#   Eqs. (22)-(23): masked convolution + mask propagation
+#   Eqs. (24)-(25): masked LSTM state update
+#   Eqs. (26)-(29): masked additive attention
+#   Table III: 24 Conv filters, stride 1, ReLU, 64 LSTM units, 5 layers,
+#              dropout 0.2
+#
+# Explicit project completions:
+#   - one pseudorange-only satellite slot is represented by
+#       [previous residual, current innovation]
+#   - the fixed 36 IMU/state features are broadcast to each valid satellite slot
+#   - Fig. 8 shows pooling, but its type/kernel/stride are unpublished; no guessed
+#     pooling operator is inserted
+#   - only the 9 correction rows with available postprocessed position/velocity/
+#     attitude truth are learned in this independent-epoch training completion
+#   - the six bias-gain rows are exactly zero because bias truth is unavailable
+#   - the paper states an inertial-measurement-error FC output but does not publish
+#     a reproducible target/use for it; it is retained as a deterministic zero
+#     placeholder rather than an untrained random "estimate"
+FIXED_FEATURE_DIM = 6 + 2 * INS_STATE_DIM   # 36
+OBSERVATION_FEATURE_DIM = 2                 # [previous residual, current innovation]
+IMU_ERROR_DIM = 6
+SUPERVISED_STATE_DIM = NAVIGATION_CORRECTION_DIM  # [position, velocity, attitude]
+MASK_NORMALIZATION_EPS = 1e-6
+
+
+@dataclass(frozen=True)
+class MaskedCLAOutput:
+    """One Masked-CLA forward pass.
+
+    Shapes
+    ------
+    kalman_gain : [B, 15, Nmax]
+    imu_error   : [B, 6] -- deterministic zero placeholder in this project
+    attention   : [B, Nmax]
+    """
+
+    kalman_gain: torch.Tensor
+    imu_error: torch.Tensor
+    attention: torch.Tensor
+
+
+class MaskedConv1d(nn.Module):
+    """Paper Eqs. (22)-(23): masked same-length Conv1D."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int = 24,
+        kernel_size: int = 3,
+    ) -> None:
+        super().__init__()
+        if in_channels <= 0 or out_channels <= 0:
+            raise ValueError("in_channels/out_channels must be positive")
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError("kernel_size must be a positive odd integer")
+
+        self.weight = nn.Parameter(
+            torch.empty(out_channels, in_channels, kernel_size)
+        )
+        self.bias = nn.Parameter(torch.zeros(out_channels))
+        nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+
+        self.kernel_size = int(kernel_size)
+        self.padding = self.kernel_size // 2
+        self.register_buffer(
+            "_mask_kernel",
+            torch.ones(1, 1, self.kernel_size),
+            persistent=False,
+        )
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3 or mask.ndim != 2:
+            raise ValueError("MaskedConv1d expects x=[B,N,C] and mask=[B,N]")
+        if x.shape[:2] != mask.shape:
+            raise ValueError("MaskedConv1d x/mask sequence shapes do not match")
+
+        m = mask.to(dtype=x.dtype).unsqueeze(1)
+
+        x_masked = x.transpose(1, 2) * m
+        z = F.conv1d(
+            x_masked,
+            self.weight,
+            bias=None,
+            stride=1,
+            padding=self.padding,
+        )
+
+        mask_kernel = self._mask_kernel.to(dtype=x.dtype)
+        local_count = F.conv1d(
+            m, mask_kernel, stride=1, padding=self.padding
+        )
+        valid_window = (local_count > 0).to(dtype=x.dtype)
+        denom = local_count.clamp_min(MASK_NORMALIZATION_EPS)
+
+        y = F.relu(
+            z / denom
+            + self.bias.view(1, -1, 1) * valid_window
+        )
+
+        y = y * m
+        return y.transpose(1, 2)
+
+
+class MaskedStackedLSTM(nn.Module):
+    """Paper Eqs. (24)-(25): five masked LSTM layers."""
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int = 64,
+        num_layers: int = 5,
+        dropout: float = 0.2,
+    ) -> None:
+        super().__init__()
+        if input_size <= 0 or hidden_size <= 0 or num_layers <= 0:
+            raise ValueError(
+                "input_size, hidden_size and num_layers must be positive"
+            )
+        if not (0.0 <= dropout < 1.0):
+            raise ValueError("dropout must be in [0,1)")
+
+        self.hidden_size = int(hidden_size)
+        self.num_layers = int(num_layers)
+        self.dropout = float(dropout)
+
+        self.cells = nn.ModuleList([
+            nn.LSTMCell(
+                input_size if layer == 0 else hidden_size,
+                hidden_size,
+            )
+            for layer in range(num_layers)
+        ])
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if x.ndim != 3 or mask.ndim != 2:
+            raise ValueError(
+                "MaskedStackedLSTM expects x=[B,N,C] and mask=[B,N]"
+            )
+        if x.shape[:2] != mask.shape:
+            raise ValueError(
+                "MaskedStackedLSTM x/mask sequence shapes do not match"
+            )
+
+        batch_size, sequence_length = x.shape[:2]
+        h = [
+            x.new_zeros(batch_size, self.hidden_size)
+            for _ in range(self.num_layers)
+        ]
+        c = [
+            x.new_zeros(batch_size, self.hidden_size)
+            for _ in range(self.num_layers)
+        ]
+        outputs: list[torch.Tensor] = []
+
+        for t in range(sequence_length):
+            mt = mask[:, t].to(dtype=x.dtype).unsqueeze(-1)
+            keep = 1.0 - mt
+            layer_input = x[:, t, :]
+
+            for layer, cell in enumerate(self.cells):
+                h_candidate, c_candidate = cell(
+                    layer_input,
+                    (h[layer], c[layer]),
+                )
+                h[layer] = mt * h_candidate + keep * h[layer]
+                c[layer] = mt * c_candidate + keep * c[layer]
+
+                layer_input = h[layer]
+                if (
+                    layer < self.num_layers - 1
+                    and self.dropout > 0.0
+                ):
+                    layer_input = F.dropout(
+                        layer_input,
+                        p=self.dropout,
+                        training=self.training,
+                    )
+
+            outputs.append(h[-1])
+
+        return torch.stack(outputs, dim=1)
+
+
+class MaskedAttention(nn.Module):
+    """Paper Eqs. (26)-(29): masked additive attention."""
+
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        if hidden_size <= 0:
+            raise ValueError("hidden_size must be positive")
+
+        self.proj = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.v = nn.Linear(hidden_size, 1, bias=False)
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if h.ndim != 3 or mask.ndim != 2:
+            raise ValueError(
+                "MaskedAttention expects h=[B,N,H] and mask=[B,N]"
+            )
+        if h.shape[:2] != mask.shape:
+            raise ValueError(
+                "MaskedAttention h/mask sequence shapes do not match"
+            )
+
+        score = self.v(
+            torch.tanh(self.proj(h))
+        ).squeeze(-1)
+
+        valid = mask.bool()
+        score = score.masked_fill(~valid, -torch.inf)
+
+        all_masked = ~valid.any(dim=1)
+        safe_score = score.masked_fill(
+            all_masked.unsqueeze(1), 0.0
+        )
+
+        alpha = torch.softmax(safe_score, dim=1)
+        alpha = alpha * valid.to(dtype=alpha.dtype)
+        denom = alpha.sum(
+            dim=1, keepdim=True
+        ).clamp_min(1e-12)
+        alpha = torch.where(
+            all_masked.unsqueeze(1),
+            torch.zeros_like(alpha),
+            alpha / denom,
+        )
+
+        context = torch.sum(
+            alpha.unsqueeze(-1) * h,
+            dim=1,
+        )
+        return context, alpha
+
+
+class MaskedCLA(nn.Module):
+    """Masked CNN-LSTM-attention Kalman-gain estimator.
+
+    The core follows Yan et al. Eqs. (22)-(29) and Table III.
+    Exact tensorization and FC-head dimensions are unpublished.
+
+    This standalone run trains fusion epochs as independent supervised items.
+    Therefore a full 15-row gain head with a position-only one-step loss would
+    leave non-position gain rows without a data gradient. The implementation
+    instead learns the 9 correction states with available postprocessed truth
+    and pads the six unlabelled bias rows with exact zeros.  Because the paper
+    does not specify how to handle N_test > Nmax_train, the gain head is shared
+    across satellite slots rather than flattened over a fixed Nmax.
+    """
+
+    def __init__(
+        self,
+        nmax: int,
+        dropout: float = 0.2,
+    ) -> None:
+        super().__init__()
+        if nmax <= 0:
+            raise ValueError("nmax must be positive")
+        if not (0.0 <= dropout < 1.0):
+            raise ValueError("dropout must be in [0,1)")
+
+        self.nmax = int(nmax)
+        self.dropout = float(dropout)
+
+        self.conv = MaskedConv1d(
+            in_channels=FIXED_FEATURE_DIM + OBSERVATION_FEATURE_DIM,
+            out_channels=24,
+            kernel_size=3,
+        )
+        self.lstm = MaskedStackedLSTM(
+            input_size=24,
+            hidden_size=64,
+            num_layers=5,
+            dropout=self.dropout,
+        )
+        self.attention = MaskedAttention(64)
+
+        # STANDARD-COMPLETION for variable measurement counts:
+        # the paper does not publish the exact FC-head tensorization.  A shared
+        # per-satellite head is used so learned parameters do not depend on the
+        # training-set Nmax.  This lets the same trained weights process a test
+        # epoch with N > training Nmax without truncating observations or using
+        # test data to resize/retrain the network.  Each gain column depends on
+        # the local masked-LSTM token and the global attention context.
+        self.gain_head = nn.Linear(
+            2 * 64,
+            SUPERVISED_STATE_DIM,
+        )
+
+        # Structural placeholder only: the paper does not publish a target/use
+        # that can be reproduced from the available data.
+        self.imu_error_head = nn.Linear(
+            64,
+            IMU_ERROR_DIM,
+        )
+        nn.init.zeros_(self.imu_error_head.weight)
+        nn.init.zeros_(self.imu_error_head.bias)
+        for parameter in self.imu_error_head.parameters():
+            parameter.requires_grad_(False)
+
+    def forward(
+        self,
+        fixed: torch.Tensor,
+        observations: torch.Tensor,
+        mask: torch.Tensor,
+        channel_mask: torch.Tensor,
+    ) -> MaskedCLAOutput:
+        if (
+            fixed.ndim != 2
+            or observations.ndim != 3
+            or mask.ndim != 2
+            or channel_mask.ndim != 3
+        ):
+            raise ValueError(
+                "fixed/observations/mask/channel_mask have invalid ranks"
+            )
+
+        batch_size = fixed.shape[0]
+        sequence_length = observations.shape[1]
+        if sequence_length <= 0:
+            raise ValueError("observations must contain at least one satellite slot")
+        expected_observations = (
+            batch_size,
+            sequence_length,
+            OBSERVATION_FEATURE_DIM,
+        )
+
+        if tuple(fixed.shape) != (
+            batch_size,
+            FIXED_FEATURE_DIM,
+        ):
+            raise ValueError(
+                f"fixed must have shape {(batch_size, FIXED_FEATURE_DIM)}, "
+                f"got {tuple(fixed.shape)}"
+            )
+        if tuple(observations.shape) != expected_observations:
+            raise ValueError(
+                f"observations must have shape {expected_observations}, "
+                f"got {tuple(observations.shape)}"
+            )
+        if tuple(mask.shape) != (
+            batch_size,
+            sequence_length,
+        ):
+            raise ValueError(
+                f"mask must have shape {(batch_size, sequence_length)}, "
+                f"got {tuple(mask.shape)}"
+            )
+        if tuple(channel_mask.shape) != expected_observations:
+            raise ValueError(
+                f"channel_mask must have shape {expected_observations}, "
+                f"got {tuple(channel_mask.shape)}"
+            )
+
+        mask_bool = mask.bool()
+        mask_values = mask_bool.to(dtype=fixed.dtype)
+
+        observations = (
+            observations
+            * channel_mask.bool().to(dtype=observations.dtype)
+        )
+
+        token = torch.cat(
+            [
+                fixed.unsqueeze(1).expand(
+                    -1, sequence_length, -1
+                ),
+                observations,
+            ],
+            dim=-1,
+        )
+        token = token * mask_values.unsqueeze(-1)
+
+        conv = self.conv(token, mask_values)
+        lstm = self.lstm(conv, mask_values)
+        context, attention = self.attention(
+            lstm,
+            mask_values,
+        )
+
+        # Shared head: one gain column per current sequence slot.  Unlike a
+        # flattened [9*Nmax] FC output, these weights are trained on every valid
+        # satellite slot and can therefore be reused when N changes at inference.
+        context_per_slot = context.unsqueeze(1).expand(-1, sequence_length, -1)
+        gain_features = torch.cat([lstm, context_per_slot], dim=-1)
+        learned_gain = self.gain_head(gain_features).transpose(1, 2)
+        learned_gain = (
+            learned_gain
+            * mask_values.unsqueeze(1)
+        )
+
+        gain = F.pad(
+            learned_gain,
+            (
+                0,
+                0,
+                0,
+                INS_STATE_DIM - SUPERVISED_STATE_DIM,
+            ),
+        )
+
+        imu_error = self.imu_error_head(context)
+
+        return MaskedCLAOutput(
+            kalman_gain=gain,
+            imu_error=imu_error,
+            attention=attention,
+        )
+
+
+# =============================================================================
+# END-TO-END SIMULATION / TRAINING / ONLINE EVALUATION
+# =============================================================================
+# Allow direct path execution as well as `python -m ...`.
+
+
+
+
+
+if __name__ == "__main__":
+
+    _run_wall_start = perf_counter()
+
+    # =========================================================================
+    # 0. USER SETTINGS
+    # =========================================================================
+    OUTPUT_DIR = _default_output_dir()
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    MAX_FUSION_EPOCHS = None
+    MAX_TEST_FUSION_EPOCHS = None
+
+    # Resume/debug mode:
+    # True  -> skip Data01 preprocessing/classical pass/training and load the
+    #          already-saved checkpoint + training normalizers from OUTPUT_DIR.
+    # False -> run the full Data01 -> training -> Data02 pipeline.
+    RESUME_TEST_ONLY = True
+    DEBUG_NUMERICS = True
+
+    # Independent-test update mode:
+    # "classical_debug" -> use the existing classical TC/KF measurement update at
+    #                      every Data02 fusion epoch. This is a diagnostic control
+    #                      used to isolate whether the divergence comes from the
+    #                      learned recursive Masked KalmanNet update.
+    # "masked_kalmannet" -> original learned online update.
+    TEST_UPDATE_MODE = "classical_debug"
+    VALID_TEST_UPDATE_MODES = {"classical_debug", "masked_kalmannet"}
+    if TEST_UPDATE_MODE not in VALID_TEST_UPDATE_MODES:
+        raise ValueError(
+            f"TEST_UPDATE_MODE must be one of {sorted(VALID_TEST_UPDATE_MODES)}, "
+            f"got {TEST_UPDATE_MODE!r}"
+        )
+
+    # Table III: Adam, initial LR=0.01, Conv=24, LSTM=64 x 5, dropout=0.2.
+    # Epoch count, batch size and validation split are unpublished completions.
+    NUM_EPOCHS = 10
+    BATCH_SIZE = 32
+    LEARNING_RATE = 0.01
+    GAMMA_L2 = 0.0
+    VALIDATION_FRACTION = 0.20
+    SEED = 0
+    TEST_LEO_SEED = LEO_SEED + 1  # independent reproducible LEO-error realization for test
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+    print("\n=== DIRECT GNSS/LEO/INS + MASKED KALMANNET ===")
+    print("runtime:", "Kaggle" if IN_KAGGLE else "local")
+    print("project root:", KAGGLE_PROJECT_ROOT)
+    print("training dataset:", TRAIN_DATASET_DIR)
+    print("test dataset:", TEST_DATASET_DIR)
+    print("TLE directory:", LEO_TLE_DIR)
+    print("output dir:", OUTPUT_DIR.resolve())
+    print("device:", DEVICE)
+    print("test update mode:", TEST_UPDATE_MODE)
+    if DEVICE == "cuda":
+        print("GPU:", torch.cuda.get_device_name(0))
+        print("PyTorch CUDA runtime:", torch.version.cuda)
+    else:
+        print("GPU: not available to PyTorch")
+
+    if not RESUME_TEST_ONLY:
+        # =========================================================================
+        # 1. LOAD RAW DATA
+        # =========================================================================
+        required = [
+            README_XML_PATH, IMU_ERROR_MODEL_PATH, ROVE_GROUND_TRUTH_PATH, IMU_GROUND_TRUTH_PATH,
+            RINEX_OBS_PATH, IMR_PATH, SP3_PATH, CLK_PATH, NAV_PATH, LEO_TLE_DIR,
+        ]
+        missing = [str(path) for path in required if not Path(path).exists()]
+        if missing:
+            raise FileNotFoundError("Missing input files:\n" + "\n".join(missing))
+
+        rover = load_smartpnt_metadata(README_XML_PATH, "01")
+        antenna_truth = load_ie_ground_truth(ROVE_GROUND_TRUTH_PATH)
+        imu_truth = load_ie_ground_truth(IMU_GROUND_TRUTH_PATH)
+        imu_models = read_imu_error_models(IMU_ERROR_MODEL_PATH)
+        imu_noise = imu_model_to_si(imu_models[rover.imu_type])
+
+        # Parse only the first raw RINEX epoch to anchor IMR TOW to GPS week.  The
+        # bounded/capped fusion epochs are parsed after the common time span is known.
+        rinex = RINEXObservationFile.open(RINEX_OBS_PATH)
+        first_rinex_epoch = next(
+            rinex.iter_epochs(allowed_constellations={"G", "C"}),
+            None,
+        )
+        if first_rinex_epoch is None:
+            raise ValueError("RINEX file contains no GPS/BDS epochs")
+
+        imr_header, imr_tow_all, imr_record_count = read_imr_tow_only(IMR_PATH)
+        if imr_record_count < 2:
+            raise ValueError("IMR file contains fewer than two usable samples")
+        if len(antenna_truth.tow_s) < 2 or len(imu_truth.tow_s) < 2:
+            raise ValueError("Ground-truth file contains fewer than two usable epochs")
+
+        # =========================================================================
+        # 2. GPST SYNCHRONIZATION
+        # =========================================================================
+        anchor_time = float(first_rinex_epoch.time_gpst_s)
+        imr_time_all = anchor_imr_tow_to_gpst_seconds(imr_tow_all, anchor_time)
+
+        antenna_truth_time = validate_strict_time_axis(
+            "training antenna truth",
+            antenna_truth.week.astype(float) * GPS_WEEK_S + antenna_truth.tow_s,
+        )
+        imu_truth_time = validate_strict_time_axis(
+            "training IMU truth",
+            imu_truth.week.astype(float) * GPS_WEEK_S + imu_truth.tow_s,
+        )
+
+        common_start = max(
+            float(imr_time_all[0]),
+            float(antenna_truth_time[0]),
+            float(imu_truth_time[0]),
+        )
+        common_end = min(
+            float(imr_time_all[-1]),
+            float(antenna_truth_time[-1]),
+            float(imu_truth_time[-1]),
+        )
+        start = int(np.searchsorted(imr_time_all, common_start, side="left"))
+        if start >= len(imr_time_all):
+            raise ValueError("Training common time span starts after the IMR file")
+        usable_imu_start = float(imr_time_all[start])
+
+        # This yields exactly the same first MAX_FUSION_EPOCHS usable epochs that the
+        # previous full-file parse retained after filtering, but stops parsing once the
+        # requested subset has been collected.
+        gnss_epochs = tuple(
+            rinex.iter_epochs(
+                allowed_constellations={"G", "C"},
+                start_time_gpst_s=usable_imu_start,
+                end_time_gpst_s=common_end,
+                max_epochs=MAX_FUSION_EPOCHS,
+                require_measurements=True,
+            )
+        )
+        if not gnss_epochs:
+            raise ValueError("RINEX file contains no usable GPS/BDS pseudorange epochs")
+
+        fusion_time = validate_strict_time_axis(
+            "training fusion",
+            np.asarray([epoch.time_gpst_s for epoch in gnss_epochs], dtype=float),
+        )
+        if len(fusion_time) < 3:
+            raise ValueError(
+                "Fewer than three synchronized GNSS fusion epochs remain; "
+                "cannot build lagged Masked KalmanNet features"
+            )
+
+        # Read and scale only the exact contiguous IMU samples that can affect the
+        # selected fusion epochs.  No IMU sample inside that interval is dropped.
+        common_stop = min(
+            int(np.searchsorted(imr_time_all, common_end, side="left")) + 1,
+            len(imr_time_all),
+        )
+        requested_stop = min(
+            int(np.searchsorted(imr_time_all, fusion_time[-1], side="left")) + 1,
+            common_stop,
+        )
+        imr = read_imr(
+            IMR_PATH,
+            scaling_mode="cpp_exact",
+            start_record=start,
+            stop_record=requested_stop,
+        )
+        imr_time = imr_time_all[start:requested_stop].copy()
+        del imr_tow_all, imr_time_all
+
+        if len(imr.tow_s) < 2:
+            raise ValueError("Selected training IMR window contains fewer than two samples")
+
+        print("IMU records in file:", imr_record_count)
+        print("IMU samples used:", len(imr.tow_s))
+        print("RINEX fusion epochs selected:", len(gnss_epochs))
+
+        # ROVE truth is the GNSS-antenna reference point; ISA-100C truth is the IMU
+        # reference point. Both exports provide position, velocity and attitude, but
+        # neither export contains accelerometer/gyro bias truth.
+        query_time = np.concatenate(([imr_time[0]], fusion_time))
+        antenna_position, _, _, _, _ = interpolate_ground_truth(
+            antenna_truth, query_time, MAX_TRUTH_INTERPOLATION_GAP_S
+        )
+        imu_position, imu_velocity, imu_heading, imu_pitch, imu_roll = interpolate_ground_truth(
+            imu_truth, query_time, MAX_TRUTH_INTERPOLATION_GAP_S
+        )
+
+        initial_imu_truth_position = imu_position[0]
+        initial_imu_truth_velocity = imu_velocity[0]
+        fusion_antenna_truth_position = antenna_position[1:]
+        fusion_imu_truth_position = imu_position[1:]
+        fusion_imu_truth_velocity = imu_velocity[1:]
+
+        print("Synchronized fusion epochs:", len(gnss_epochs))
+
+        # =========================================================================
+        # 3. INITIAL 15-STATE INS
+        # =========================================================================
+        C_b_e = body_to_ecef_from_ie_hpr(
+            initial_imu_truth_position, imu_heading[0], imu_pitch[0], imu_roll[0], rover.mounting_xyz_deg
+        )
+        lever_arm_b_m = transform_lever_arm_vehicle_to_body(
+            rover.lever_arm_vehicle_m, *rover.mounting_xyz_deg
+        )
+
+        # Dataset check: ROVE truth must equal ISA-100C IMU truth plus the documented
+        # IMU->GNSS lever arm. This also verifies that the two truth files were assigned
+        # to the correct reference points.
+        initial_antenna_from_imu = initial_imu_truth_position + C_b_e @ lever_arm_b_m
+        truth_reference_error_m = np.linalg.norm(antenna_position[0] - initial_antenna_from_imu)
+        if truth_reference_error_m > 0.05:
+            raise ValueError(
+                f"ROVE/ISA-100C ground-truth reference points are inconsistent with the lever arm: "
+                f"{truth_reference_error_m:.3f} m"
+            )
+
+        fusion_truth_body_to_ecef = np.stack([
+            body_to_ecef_from_ie_hpr(p, h, pt, r, rover.mounting_xyz_deg)
+            for p, h, pt, r in zip(imu_position[1:], imu_heading[1:], imu_pitch[1:], imu_roll[1:])
+        ])
+
+        initial_nav = NavigationState(
+            initial_imu_truth_position.copy(),
+            initial_imu_truth_velocity.copy(),
+            C_b_e,
+            np.zeros(3),
+            np.zeros(3),
+        )
+
+        P0 = initial_covariance_from_imu_model(imu_noise)
+        Qc = continuous_process_covariance_from_imu_model(imu_noise)
+
+        # =========================================================================
+        # 4. GNSS + TLE/SGP4 LEO MODELS
+        # =========================================================================
+        ionosphere_coefficients = None
+        if USE_IONOSPHERE:
+            iono_header = read_rinex_navigation_header(NAV_PATH)
+            ionosphere_coefficients = {
+                "G": (np.asarray(iono_header["GPSA"]), np.asarray(iono_header["GPSB"])),
+                "C": (np.asarray(iono_header["BDSA"]), np.asarray(iono_header["BDSB"])),
+            }
+
+        gnss_preprocessor = GNSSPreprocessor(
+            SP3Orbit(SP3_PATH),
+            RINEXClock(CLK_PATH),
+            min_elevation_deg=MIN_GNSS_ELEVATION_DEG,
+            use_ionosphere=USE_IONOSPHERE,
+            use_troposphere=USE_TROPOSPHERE,
+            broadcast_ionosphere_coefficients=ionosphere_coefficients,
+        )
+        tle_provider = TLESGP4Provider(
+            LEO_TLE_DIR,
+            max_tle_age_days=TLE_MAX_AGE_DAYS,
+            allow_degraded_eop=TLE_ALLOW_DEGRADED_EOP,
+            allow_non_tle_files=TLE_ALLOW_NON_TLE_FILES,
+        )
+        leo_klobuchar = (
+            None
+            if ionosphere_coefficients is None
+            else ionosphere_coefficients["G"]
+        )
+        leo_simulator = LEODownlinkSimulator(
+            tle_provider,
+            leo_klobuchar,
+            seed=LEO_SEED,
+            tx_epsilon_position_m=LEO_TX_EPSILON_POSITION_M,
+            tx_max_iterations=LEO_TX_MAX_ITERATIONS,
+            minimum_elevation_deg=LEO_MIN_ELEVATION_DEG,
+            prefilter_guard_deg=LEO_PREFILTER_GUARD_DEG,
+            use_ionosphere=USE_IONOSPHERE,
+            use_troposphere=USE_TROPOSPHERE,
+        )
+        print("TLE satellites:", len(tle_provider.satellite_ids))
+        print("LEO residual model: Ref. [35] ionosphere/troposphere/MP; URA and receiver noise omitted")
+
+        # =========================================================================
+        # 5. CLASSICAL TC PASS -> TRAINING HISTORY
+        # =========================================================================
+        nav = initial_nav.copy()
+        P = P0.copy()
+        history_rows = []
+
+        # Current corrected IMU values are needed by the feature vector.
+        last_gyro, last_accel = compensate_imu(
+            imr.angular_rate_body_radps[0],
+            imr.acceleration_body_mps2[0],
+            nav.gyroscope_bias_body_radps,
+            nav.accelerometer_bias_body_mps2,
+        )
+
+        training_timeline = build_exact_fusion_timeline(
+            imr_time,
+            fusion_time,
+            through_last_fusion=True,
+        )
+
+        for event in training_timeline:
+            if isinstance(event, PropagationSegment):
+                imu_index = event.imu_index
+                dt = event.end_time_gpst_s - event.start_time_gpst_s
+                last_gyro, last_accel = compensate_imu(
+                    imr.angular_rate_body_radps[imu_index],
+                    imr.acceleration_body_mps2[imu_index],
+                    nav.gyroscope_bias_body_radps,
+                    nav.accelerometer_bias_body_mps2,
+                )
+                nav = mechanize_ecef(nav, last_gyro, last_accel, dt)
+                F_error = build_error_state_dynamics(nav, last_accel)
+                Phi, Qd = discretize_process_noise_van_loan(F_error, Qc, dt)
+                P = Phi @ P @ Phi.T + Qd
+                P = 0.5 * (P + P.T)
+                continue
+
+            fusion_index = event.fusion_index
+            t = event.time_gpst_s
+            epoch = gnss_epochs[fusion_index]
+            if abs(epoch.time_gpst_s - t) > 1e-9:
+                raise RuntimeError("training fusion timeline/epoch timestamp mismatch")
+
+            # -------- GNSS + LEO pseudoranges --------
+            gnss_measurements = gnss_preprocessor.prepare_epoch(
+                epoch, nav, lever_arm_b_m
+            )
+            # Truth is used only as the physical receiver trajectory that generates
+            # the simulated LEO observation. It is not passed to the TC predictor.
+            leo_measurements = leo_simulator.simulate_epoch(
+                t, fusion_antenna_truth_position[fusion_index]
+            )
+            measurements = retain_clock_observable_measurements(
+                tuple(gnss_measurements) + tuple(leo_measurements)
+            )
+
+            if not measurements:
+                continue
+
+            prior_nav = nav.copy()
+            prior_position = gnss_antenna_position(prior_nav, lever_arm_b_m)
+            measurement_model = build_measurement_model(
+                nav, measurements, lever_arm_b_m
+            )
+
+            # Closed-loop 15-state error-state convention: after feedback/reset,
+            # the propagated error-state mean is zero.
+            error_state_pred = np.zeros(INS_STATE_DIM)
+            correction, P, _ = kalman_measurement_update(
+                P,
+                measurement_model.innovation,
+                measurement_model.H,
+                measurement_model.R,
+            )
+            error_state_post = error_state_pred + correction
+            nav = inject_error_state(nav, correction)
+
+            posterior_position = gnss_antenna_position(nav, lever_arm_b_m)
+            posterior_residual = build_innovation_only(
+                nav, measurements, lever_arm_b_m
+            )
+            counts = Counter(m.constellation for m in measurements)
+
+            target_state_9 = np.concatenate([
+                fusion_imu_truth_position[fusion_index] - prior_nav.position_ecef_m,
+                fusion_imu_truth_velocity[fusion_index] - prior_nav.velocity_ecef_mps,
+                attitude_error_state_target(
+                    prior_nav.body_to_ecef_dcm,
+                    fusion_truth_body_to_ecef[fusion_index],
+                ),
+            ])
+
+            history_rows.append({
+                "time": t,
+                "sat_ids": measurement_model.sat_ids,
+                "innovation": measurement_model.innovation.copy(),
+                "residual": posterior_residual.copy(),
+                "x_pred": error_state_pred.copy(),
+                "x_post": error_state_post.copy(),
+                "accel": last_accel.copy(),
+                "gyro": last_gyro.copy(),
+                "prior_position": prior_position.copy(),
+                "posterior_position": posterior_position.copy(),
+                "truth_position": fusion_antenna_truth_position[fusion_index].copy(),
+                "target_state_9": target_state_9.copy(),
+                "n_total": len(measurements),
+                "n_gnss": counts["G"] + counts["C"],
+                "n_leo": counts["L"],
+            })
+
+        print("Usable classical fusion rows:", len(history_rows))
+        if len(history_rows) < 3:
+            raise ValueError(
+                "Classical TC pass produced fewer than three usable measurement rows; "
+                "check GNSS products, TLE coverage, masks, and time synchronization"
+            )
+
+        # =========================================================================
+        # 6. PAPER Eqs. (10)-(21): DIRECT CAUSAL FEATURES + PADDING/MASKS
+        # =========================================================================
+        nmax = max(len(row["sat_ids"]) for row in history_rows)
+        feature_time = []
+        fixed = []
+        observations = []
+        channel_masks = []
+        innovation_padded = []
+        residual_padded = []
+        target_states_9 = []
+        prior_positions = []
+        truth_positions = []
+
+        # First classical row supplies lagged context only.
+        for k in range(1, len(history_rows)):
+            current = history_rows[k]
+            previous = history_rows[k - 1]
+
+            delta_accel = current["accel"] - previous["accel"]
+            delta_gyro = current["gyro"] - previous["gyro"]
+            # Paper Eq. (12): posterior-minus-prior state innovation.
+            # In this closed-loop implementation x_pred is normally zero after reset,
+            # but retaining it explicitly makes the state semantics unambiguous.
+            previous_state_innovation = previous["x_post"] - previous["x_pred"]
+            previous_state_residual = (
+                np.zeros(INS_STATE_DIM)
+                if k == 1
+                else previous["x_post"] - history_rows[k - 2]["x_post"]
+            )
+            fixed_k = np.concatenate([
+                delta_accel,
+                delta_gyro,
+                previous_state_residual,
+                previous_state_innovation,
+            ])  # [36]
+
+            n = len(current["sat_ids"])
+            innovation_k = np.zeros(nmax)
+            innovation_k[:n] = current["innovation"]
+            current_mask = np.zeros(nmax, dtype=bool)
+            current_mask[:n] = True
+
+            previous_residual_by_sat = dict(zip(previous["sat_ids"], previous["residual"]))
+            residual_k = np.zeros(nmax)
+            residual_mask = np.zeros(nmax, dtype=bool)
+            for slot, sat_id in enumerate(current["sat_ids"]):
+                if sat_id in previous_residual_by_sat:
+                    residual_k[slot] = previous_residual_by_sat[sat_id]
+                    residual_mask[slot] = True
+
+            feature_time.append(current["time"])
+            fixed.append(fixed_k)
+            observations.append(np.stack([residual_k, innovation_k], axis=1))
+            channel_masks.append(np.stack([residual_mask, current_mask], axis=1))
+            innovation_padded.append(innovation_k)
+            residual_padded.append(residual_k)
+            target_states_9.append(current["target_state_9"])
+            prior_positions.append(current["prior_position"])
+            truth_positions.append(current["truth_position"])
+
+        feature_time = np.asarray(feature_time)
+        fixed = np.stack(fixed)
+        observations = np.stack(observations)
+        channel_masks = np.stack(channel_masks)
+        innovation_padded = np.stack(innovation_padded)
+        residual_padded = np.stack(residual_padded)
+        target_states_9 = np.stack(target_states_9)
+
+        # features.py-style structural checks: fail early rather than silently
+        # accepting malformed padding, masks, time ordering, or non-finite values.
+        expected_t = len(feature_time)
+        if fixed.shape != (expected_t, FIXED_FEATURE_DIM):
+            raise ValueError(f"fixed feature shape must be {(expected_t, FIXED_FEATURE_DIM)}, got {fixed.shape}")
+        if innovation_padded.shape != (expected_t, nmax):
+            raise ValueError("innovation_padded must have shape [T,Nmax]")
+        if residual_padded.shape != (expected_t, nmax):
+            raise ValueError("residual_padded must have shape [T,Nmax]")
+        if channel_masks.shape != (expected_t, nmax, OBSERVATION_FEATURE_DIM):
+            raise ValueError("channel_masks must have shape [T,Nmax,2]")
+        if expected_t > 1 and not np.all(np.diff(feature_time) > 0.0):
+            raise ValueError("feature times must be strictly increasing")
+        if not np.all(np.isfinite(fixed)) or not np.all(np.isfinite(innovation_padded)) or not np.all(np.isfinite(residual_padded)):
+            raise ValueError("feature arrays contain non-finite values")
+        if np.any(innovation_padded[~channel_masks[:, :, 1]] != 0.0):
+            raise ValueError("masked innovation padding must be exactly zero")
+        if np.any(residual_padded[~channel_masks[:, :, 0]] != 0.0):
+            raise ValueError("masked residual padding must be exactly zero")
+        prior_positions = np.stack(prior_positions)
+        truth_positions = np.stack(truth_positions)
+        satellite_masks = channel_masks[:, :, 1]
+
+        np.savez(
+            OUTPUT_DIR / "training_direct.npz",
+            time_gpst_s=feature_time,
+            fixed=fixed,
+            observations=observations,
+            channel_mask=channel_masks,
+            innovation_padded=innovation_padded,
+            residual_padded=residual_padded,
+            target_state_position_velocity_attitude=target_states_9,
+            prior_position_ecef_m=prior_positions,
+            truth_position_ecef_m=truth_positions,
+            measurement_mode=np.asarray("pseudorange_only"),
+            feature_timing=np.asarray("causal_lagged"),
+        )
+
+        # =========================================================================
+        # 7. CONTIGUOUS TRAIN/VALIDATION SPLIT + TRAIN-ONLY NORMALIZATION
+        # =========================================================================
+        random.seed(SEED)
+        np.random.seed(SEED)
+        torch.manual_seed(SEED)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(SEED)
+
+        sample_count = len(feature_time)
+        validation_count = max(1, int(round(sample_count * VALIDATION_FRACTION)))
+        split = sample_count - validation_count
+        if split < 1 or validation_count < 1:
+            raise ValueError(
+                "Not enough feature samples for a non-empty contiguous train/validation split"
+            )
+        train_index = np.arange(split)
+        val_index = np.arange(split, sample_count)
+
+        fixed_mean = fixed[train_index].mean(axis=0)
+        fixed_std = fixed[train_index].std(axis=0)
+        fixed_std[fixed_std < 1e-8] = 1.0
+
+        obs_mean = np.zeros(2)
+        obs_std = np.ones(2)
+        # Only valid current-satellite slots contribute; padded slots never do.
+        valid_channels = channel_masks[train_index] & channel_masks[train_index, :, 1, None]
+        for channel in range(2):
+            values = observations[train_index, :, channel][valid_channels[:, :, channel]]
+            if values.size:
+                obs_mean[channel] = values.mean()
+                s = values.std()
+                obs_std[channel] = 1.0 if s < 1e-8 else s
+
+        fixed_normalized = (fixed - fixed_mean) / fixed_std
+        observations_normalized = (observations - obs_mean.reshape(1, 1, 2)) / obs_std.reshape(1, 1, 2)
+        observations_normalized = np.where(channel_masks, observations_normalized, 0.0)
+
+        # Position [m], velocity [m/s], and attitude [rad] have different units/scales.
+        # Standardize only the supervised correction error in the loss, using training
+        # data only, so all nine observable state rows receive comparable gradients.
+        target_state_scale = target_states_9[train_index].std(axis=0)
+        target_state_scale[target_state_scale < 1e-8] = 1.0
+
+        np.savez(
+            OUTPUT_DIR / "normalizer.npz",
+            fixed_mean=fixed_mean,
+            fixed_std=fixed_std,
+            obs_mean=obs_mean,
+            obs_std=obs_std,
+            target_state_scale=target_state_scale,
+        )
+
+        dataset = TensorDataset(
+            torch.tensor(fixed_normalized, dtype=torch.float32),
+            torch.tensor(observations_normalized, dtype=torch.float32),
+            torch.tensor(satellite_masks, dtype=torch.bool),
+            torch.tensor(channel_masks, dtype=torch.bool),
+            torch.tensor(innovation_padded, dtype=torch.float32),
+            torch.tensor(target_states_9, dtype=torch.float64),
+        )
+        train_dataset = torch.utils.data.Subset(dataset, train_index.tolist())
+        val_dataset = torch.utils.data.Subset(dataset, val_index.tolist())
+        use_pinned_memory = DEVICE == "cuda"
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=True,
+            generator=torch.Generator().manual_seed(SEED),
+            pin_memory=use_pinned_memory,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            pin_memory=use_pinned_memory,
+        )
+
+        print(f"train={len(train_index)}, validation={len(val_index)}, Nmax={nmax}")
+
+        # =========================================================================
+        # 8. DIRECT MASKED CLA TRAINING
+        # =========================================================================
+        model = MaskedCLA(nmax=nmax, dropout=0.2).to(DEVICE)
+        optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+        best_val_loss = float("inf")
+        best_state = None
+        training_history = []
+        target_scale_tensor = torch.tensor(target_state_scale, dtype=torch.float64, device=DEVICE)
+
+        for epoch in range(1, NUM_EPOCHS + 1):
+            model.train()
+            train_sum = 0.0
+            train_count = 0
+
+            for batch in train_loader:
+                fixed_b, obs_b, mask_b, channel_b, innovation_b, target_b = [x.to(DEVICE, non_blocking=use_pinned_memory) for x in batch]
+                optimizer.zero_grad(set_to_none=True)
+                output = model(fixed_b, obs_b, mask_b, channel_b)
+                correction = torch.bmm(output.kalman_gain, innovation_b.unsqueeze(-1)).squeeze(-1)
+                normalized_error = (correction[:, :SUPERVISED_STATE_DIM].double() - target_b) / target_scale_tensor
+                data_mse = torch.mean(normalized_error**2)
+                if GAMMA_L2:
+                    l2 = sum(torch.sum(p * p) for p in model.parameters() if p.requires_grad)
+                    loss = data_mse + GAMMA_L2 * l2
+                else:
+                    loss = data_mse
+                loss.backward()
+                optimizer.step()
+                train_sum += float(loss.detach().cpu()) * len(fixed_b)
+                train_count += len(fixed_b)
+
+            model.eval()
+            val_sum = 0.0
+            val_count = 0
+            with torch.inference_mode():
+                for batch in val_loader:
+                    fixed_b, obs_b, mask_b, channel_b, innovation_b, target_b = [x.to(DEVICE, non_blocking=use_pinned_memory) for x in batch]
+                    output = model(fixed_b, obs_b, mask_b, channel_b)
+                    correction = torch.bmm(output.kalman_gain, innovation_b.unsqueeze(-1)).squeeze(-1)
+                    normalized_error = (correction[:, :SUPERVISED_STATE_DIM].double() - target_b) / target_scale_tensor
+                    data_mse = torch.mean(normalized_error**2)
+                    if GAMMA_L2:
+                        l2 = sum(torch.sum(p * p) for p in model.parameters() if p.requires_grad)
+                        loss = data_mse + GAMMA_L2 * l2
+                    else:
+                        loss = data_mse
+                    val_sum += float(loss.cpu()) * len(fixed_b)
+                    val_count += len(fixed_b)
+
+            train_loss = train_sum / train_count
+            val_loss = val_sum / val_count
+            training_history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
+            print(f"epoch {epoch:02d}/{NUM_EPOCHS}: train={train_loss:.6g}, val={val_loss:.6g}")
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+
+        if best_state is None:
+            raise RuntimeError("Training completed without producing a valid model state")
+        model.load_state_dict(best_state)
+        torch.save(
+            {
+                "model_state_dict": best_state,
+                "nmax": nmax,  # retained for checkpoint compatibility / training padding metadata
+                "training_nmax": nmax,
+                "variable_length_gain_head": True,
+                "measurement_mode": "pseudorange_only",
+                "feature_timing": "causal_lagged",
+                "fixed_mean": fixed_mean,
+                "fixed_std": fixed_std,
+                "obs_mean": obs_mean,
+                "obs_std": obs_std,
+                "target_state_scale": target_state_scale,
+                "supervised_state_dim": SUPERVISED_STATE_DIM,
+                "bias_gain_rows_forced_zero": True,
+                "classical_bias_gain_rows_forced_zero": True,
+                "masked_cla_core": "Yan_Eqs_22_to_29_Table_III",
+                "cnn_tensorization": "project_specific_fixed36_broadcast_plus_two_PR_channels",
+                "gain_head": "shared_per_satellite_[local_LSTM,global_attention_context]_to_9_state_column",
+                "pooling": "not_implemented_unpublished_parameters",
+                "imu_error_head": "structural_zero_placeholder_not_trained_or_used",
+                "training_mode": "independent_epoch_direct_9_state_supervision_not_paper_exact_end_to_end",
+            },
+            OUTPUT_DIR / "best_model.pt",
+        )
+        (OUTPUT_DIR / "history.json").write_text(json.dumps(training_history, indent=2), encoding="utf-8")
+
+    else:
+        checkpoint_path = OUTPUT_DIR / "best_model.pt"
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(
+                "RESUME_TEST_ONLY=True but the trained checkpoint is missing: "
+                f"{checkpoint_path}. Run the full Data01 training once, or set "
+                "RESUME_TEST_ONLY=False."
+            )
+
+        try:
+            checkpoint = torch.load(
+                checkpoint_path,
+                map_location=DEVICE,
+                weights_only=False,
+            )
+        except TypeError:
+            # Compatibility with older PyTorch versions that do not expose
+            # the weights_only keyword.
+            checkpoint = torch.load(
+                checkpoint_path,
+                map_location=DEVICE,
+            )
+
+        nmax = int(checkpoint.get("training_nmax", checkpoint["nmax"]))
+        fixed_mean = np.asarray(checkpoint["fixed_mean"], dtype=float)
+        fixed_std = np.asarray(checkpoint["fixed_std"], dtype=float)
+        obs_mean = np.asarray(checkpoint["obs_mean"], dtype=float)
+        obs_std = np.asarray(checkpoint["obs_std"], dtype=float)
+        target_state_scale = np.asarray(
+            checkpoint.get(
+                "target_state_scale",
+                np.ones(SUPERVISED_STATE_DIM),
+            ),
+            dtype=float,
+        )
+
+        if fixed_mean.shape != (FIXED_FEATURE_DIM,) or fixed_std.shape != (FIXED_FEATURE_DIM,):
+            raise ValueError("checkpoint fixed-feature normalizer has incompatible shape")
+        if obs_mean.shape != (OBSERVATION_FEATURE_DIM,) or obs_std.shape != (OBSERVATION_FEATURE_DIM,):
+            raise ValueError("checkpoint observation normalizer has incompatible shape")
+        if not (
+            np.all(np.isfinite(fixed_mean))
+            and np.all(np.isfinite(fixed_std))
+            and np.all(np.isfinite(obs_mean))
+            and np.all(np.isfinite(obs_std))
+            and np.all(fixed_std > 0.0)
+            and np.all(obs_std > 0.0)
+        ):
+            raise ValueError("checkpoint contains invalid normalization statistics")
+
+        model = MaskedCLA(nmax=nmax, dropout=0.2).to(DEVICE)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.eval()
+
+        # Section 9 reuses the TLE provider that the full pipeline normally
+        # constructs in the Data01 branch. Recreate only that shared orbit source;
+        # no Data01 observations, IMU, truth, classical history, features, or
+        # training are loaded/recomputed in resume mode.
+        tle_provider = TLESGP4Provider(
+            LEO_TLE_DIR,
+            max_tle_age_days=TLE_MAX_AGE_DAYS,
+            allow_degraded_eop=TLE_ALLOW_DEGRADED_EOP,
+            allow_non_tle_files=TLE_ALLOW_NON_TLE_FILES,
+        )
+        leo_simulator = None
+
+        print("\n=== RESUME TEST-ONLY MODE ===")
+        print("checkpoint:", checkpoint_path.resolve())
+        print("training Nmax:", nmax)
+        print("Data01 preprocessing/training: SKIPPED")
+
+    # =========================================================================
+    # 9. LOAD AND SYNCHRONIZE THE INDEPENDENT TEST DATASET
+    # =========================================================================
+    # Important: no test sample is used above for fitting the model or normalizers.
+    test_dataset_dir = resolve_test_dataset_dir()
+    if test_dataset_dir.resolve() == TRAIN_DATASET_DIR.resolve():
+        raise ValueError(
+            "The online test dataset must be distinct from the training dataset"
+        )
+    test_files, test_rover = resolve_dataset_files(test_dataset_dir, "01")
+
+    test_required = [IMU_ERROR_MODEL_PATH, LEO_TLE_DIR]
+    test_missing = [str(path) for path in test_required if not Path(path).exists()]
+    if test_missing:
+        raise FileNotFoundError("Missing shared test inputs:\n" + "\n".join(test_missing))
+
+    test_antenna_truth = load_ie_ground_truth(test_files.rover_ground_truth)
+    test_imu_truth = load_ie_ground_truth(test_files.imu_ground_truth)
+    test_imu_models = read_imu_error_models(IMU_ERROR_MODEL_PATH)
+    if test_rover.imu_type not in test_imu_models:
+        raise KeyError(f"No IMU noise model for test IMU type {test_rover.imu_type!r}")
+    test_imu_noise = imu_model_to_si(test_imu_models[test_rover.imu_type])
+
+    test_rinex = RINEXObservationFile.open(test_files.rinex_obs)
+    first_test_rinex_epoch = next(
+        test_rinex.iter_epochs(allowed_constellations={"G", "C"}),
+        None,
+    )
+    if first_test_rinex_epoch is None:
+        raise ValueError("Test RINEX file contains no GPS/BDS epochs")
+
+    test_imr_header, test_imr_tow_all, test_imr_record_count = read_imr_tow_only(
+        test_files.imr
+    )
+    if test_imr_record_count < 2:
+        raise ValueError("Test IMR file contains fewer than two usable samples")
+    if len(test_antenna_truth.tow_s) < 2 or len(test_imu_truth.tow_s) < 2:
+        raise ValueError("Test ground-truth file contains fewer than two usable epochs")
+
+    # Same validated GPST anchoring used by the training dataset.
+    test_anchor_time = float(first_test_rinex_epoch.time_gpst_s)
+    test_imr_time_all = anchor_imr_tow_to_gpst_seconds(
+        test_imr_tow_all,
+        test_anchor_time,
+    )
+
+    test_antenna_truth_time = validate_strict_time_axis(
+        "test antenna truth",
+        test_antenna_truth.week.astype(float) * GPS_WEEK_S
+        + test_antenna_truth.tow_s,
+    )
+    test_imu_truth_time = validate_strict_time_axis(
+        "test IMU truth",
+        test_imu_truth.week.astype(float) * GPS_WEEK_S
+        + test_imu_truth.tow_s,
+    )
+
+    test_common_start = max(
+        float(test_imr_time_all[0]),
+        float(test_antenna_truth_time[0]),
+        float(test_imu_truth_time[0]),
+    )
+    test_common_end = min(
+        float(test_imr_time_all[-1]),
+        float(test_antenna_truth_time[-1]),
+        float(test_imu_truth_time[-1]),
+    )
+    test_start = int(
+        np.searchsorted(test_imr_time_all, test_common_start, side="left")
+    )
+    if test_start >= len(test_imr_time_all):
+        raise ValueError("Test common time span starts after the IMR file")
+    test_usable_imu_start = float(test_imr_time_all[test_start])
+
+    test_gnss_epochs = tuple(
+        test_rinex.iter_epochs(
+            allowed_constellations={"G", "C"},
+            start_time_gpst_s=test_usable_imu_start,
+            end_time_gpst_s=test_common_end,
+            max_epochs=MAX_TEST_FUSION_EPOCHS,
+            require_measurements=True,
+        )
+    )
+    if not test_gnss_epochs:
+        raise ValueError("Test RINEX file contains no usable GPS/BDS pseudorange epochs")
+
+    test_fusion_time = validate_strict_time_axis(
+        "test fusion",
+        np.asarray(
+            [epoch.time_gpst_s for epoch in test_gnss_epochs], dtype=float
+        ),
+    )
+    if len(test_fusion_time) < 1:
+        raise ValueError("No synchronized test GNSS fusion epochs remain")
+
+    test_common_stop = min(
+        int(np.searchsorted(test_imr_time_all, test_common_end, side="left")) + 1,
+        len(test_imr_time_all),
+    )
+    test_requested_stop = min(
+        int(np.searchsorted(test_imr_time_all, test_fusion_time[-1], side="left")) + 1,
+        test_common_stop,
+    )
+    test_imr = read_imr(
+        test_files.imr,
+        scaling_mode="cpp_exact",
+        start_record=test_start,
+        stop_record=test_requested_stop,
+    )
+    test_imr_time = test_imr_time_all[test_start:test_requested_stop].copy()
+    del test_imr_tow_all, test_imr_time_all
+
+    if len(test_imr.tow_s) < 2:
+        raise ValueError("Selected test IMR window contains fewer than two samples")
+
+    test_query_time = np.concatenate(([test_imr_time[0]], test_fusion_time))
+    test_antenna_position, _, _, _, _ = interpolate_ground_truth(
+        test_antenna_truth,
+        test_query_time,
+        MAX_TRUTH_INTERPOLATION_GAP_S,
+    )
+    (
+        test_imu_position,
+        test_imu_velocity,
+        test_imu_heading,
+        test_imu_pitch,
+        test_imu_roll,
+    ) = interpolate_ground_truth(
+        test_imu_truth,
+        test_query_time,
+        MAX_TRUTH_INTERPOLATION_GAP_S,
+    )
+
+    test_fusion_antenna_truth_position = test_antenna_position[1:]
+
+    test_C_b_e = body_to_ecef_from_ie_hpr(
+        test_imu_position[0],
+        test_imu_heading[0],
+        test_imu_pitch[0],
+        test_imu_roll[0],
+        test_rover.mounting_xyz_deg,
+    )
+    test_lever_arm_b_m = transform_lever_arm_vehicle_to_body(
+        test_rover.lever_arm_vehicle_m,
+        *test_rover.mounting_xyz_deg,
+    )
+
+    # Same reference-point consistency check used for the training dataset.
+    test_initial_antenna_from_imu = (
+        test_imu_position[0] + test_C_b_e @ test_lever_arm_b_m
+    )
+    test_truth_reference_error_m = np.linalg.norm(
+        test_antenna_position[0] - test_initial_antenna_from_imu
+    )
+    if test_truth_reference_error_m > 0.05:
+        raise ValueError(
+            "Test ROVE/IMU ground-truth reference points are inconsistent with "
+            f"the lever arm: {test_truth_reference_error_m:.3f} m"
+        )
+
+    test_initial_nav = NavigationState(
+        test_imu_position[0].copy(),
+        test_imu_velocity[0].copy(),
+        test_C_b_e,
+        np.zeros(3),
+        np.zeros(3),
+    )
+    test_P0 = initial_covariance_from_imu_model(test_imu_noise)
+    test_Qc = continuous_process_covariance_from_imu_model(test_imu_noise)
+
+    test_ionosphere_coefficients = None
+    if USE_IONOSPHERE:
+        test_iono_header = read_rinex_navigation_header(test_files.nav)
+        test_ionosphere_coefficients = {
+            "G": (
+                np.asarray(test_iono_header["GPSA"]),
+                np.asarray(test_iono_header["GPSB"]),
+            ),
+            "C": (
+                np.asarray(test_iono_header["BDSA"]),
+                np.asarray(test_iono_header["BDSB"]),
+            ),
+        }
+
+    test_gnss_preprocessor = GNSSPreprocessor(
+        SP3Orbit(test_files.sp3),
+        RINEXClock(test_files.clk),
+        min_elevation_deg=MIN_GNSS_ELEVATION_DEG,
+        use_ionosphere=USE_IONOSPHERE,
+        use_troposphere=USE_TROPOSPHERE,
+        broadcast_ionosphere_coefficients=test_ionosphere_coefficients,
+    )
+    test_leo_klobuchar = (
+        None
+        if test_ionosphere_coefficients is None
+        else test_ionosphere_coefficients["G"]
+    )
+    test_leo_simulator = LEODownlinkSimulator(
+        tle_provider,
+        test_leo_klobuchar,
+        seed=TEST_LEO_SEED,
+        tx_epsilon_position_m=LEO_TX_EPSILON_POSITION_M,
+        tx_max_iterations=LEO_TX_MAX_ITERATIONS,
+        minimum_elevation_deg=LEO_MIN_ELEVATION_DEG,
+        prefilter_guard_deg=LEO_PREFILTER_GUARD_DEG,
+        use_ionosphere=USE_IONOSPHERE,
+        use_troposphere=USE_TROPOSPHERE,
+    )
+
+    print("\n=== INDEPENDENT TEST DATASET ===")
+    print("dataset:", test_dataset_dir)
+    print("test IMU records in file:", test_imr_record_count)
+    print("test IMU samples used:", len(test_imr.tow_s))
+    print("test RINEX fusion epochs selected:", len(test_gnss_epochs))
+
+    # =========================================================================
+    # 10. ONLINE TEST PASS
+    #     - masked_kalmannet: original learned recursive update
+    #     - classical_debug: classical TC/KF control run for divergence diagnosis
+    # =========================================================================
+    model = model.to(DEVICE)
+    model.eval()
+    if TEST_UPDATE_MODE == "classical_debug":
+        print("\n=== CLASSICAL TC/KF DIAGNOSTIC MODE ===")
+        print("Masked KalmanNet inference: BYPASSED")
+        print("Data02 measurement update: classical TC/KF at every usable fusion epoch")
+    else:
+        print("\n=== MASKED KALMANNET ONLINE MODE ===")
+
+    nav = test_initial_nav.copy()
+    P = test_P0.copy()
+    online_rows = []
+    debug_trace = []
+    online_warm_start_time = None
+    previous_online = None
+    previous_previous_x_post = None
+
+    last_gyro, last_accel = compensate_imu(
+        test_imr.angular_rate_body_radps[0],
+        test_imr.acceleration_body_mps2[0],
+        nav.gyroscope_bias_body_radps,
+        nav.accelerometer_bias_body_mps2,
+    )
+    test_timeline = build_exact_fusion_timeline(
+        test_imr_time,
+        test_fusion_time,
+        through_last_fusion=True,
+    )
+
+    for event in test_timeline:
+        if isinstance(event, PropagationSegment):
+            imu_index = event.imu_index
+            dt = event.end_time_gpst_s - event.start_time_gpst_s
+            last_gyro, last_accel = compensate_imu(
+                test_imr.angular_rate_body_radps[imu_index],
+                test_imr.acceleration_body_mps2[imu_index],
+                nav.gyroscope_bias_body_radps,
+                nav.accelerometer_bias_body_mps2,
+            )
+            nav = mechanize_ecef(nav, last_gyro, last_accel, dt)
+            F_error = build_error_state_dynamics(nav, last_accel)
+            Phi, Qd = discretize_process_noise_van_loan(
+                F_error, test_Qc, dt
+            )
+            P = Phi @ P @ Phi.T + Qd
+            P = 0.5 * (P + P.T)
+            continue
+
+        fusion_index = event.fusion_index
+        t = event.time_gpst_s
+        epoch = test_gnss_epochs[fusion_index]
+        if abs(epoch.time_gpst_s - t) > 1e-9:
+            raise RuntimeError("test fusion timeline/epoch timestamp mismatch")
+
+        gnss_measurements = test_gnss_preprocessor.prepare_epoch(
+            epoch, nav, test_lever_arm_b_m
+        )
+        # As in training, test truth is used only to generate the simulated LEO
+        # measurement; it is not an input to the learned navigation update.
+        leo_measurements = test_leo_simulator.simulate_epoch(
+            t, test_fusion_antenna_truth_position[fusion_index]
+        )
+        measurements = retain_clock_observable_measurements(
+            tuple(gnss_measurements) + tuple(leo_measurements)
+        )
+
+        if not measurements:
+            continue
+
+        measurement_model = build_measurement_model(
+            nav,
+            measurements,
+            test_lever_arm_b_m,
+        )
+
+        # ---------------------------------------------------------------------
+        # Classical control experiment.
+        #
+        # This branch deliberately bypasses the MaskedCLA network and applies the
+        # same classical TC/KF update used to generate the Data01 history.  It is
+        # a diagnostic experiment only: if this path remains numerically stable
+        # over all of Data02 while the learned closed-loop path diverges, the
+        # failure is localized to the learned recursive update / train-test
+        # distribution mismatch rather than to the common INS, synchronization,
+        # GNSS/LEO preprocessing, H/R construction, or fusion scheduler.
+        # ---------------------------------------------------------------------
+        if TEST_UPDATE_MODE == "classical_debug":
+            n = len(measurements)
+            current_sat_ids = measurement_model.sat_ids
+            innovation_k = np.asarray(
+                measurement_model.innovation, dtype=float
+            ).copy()
+
+            correction, P, classical_gain = kalman_measurement_update(
+                P,
+                measurement_model.innovation,
+                measurement_model.H,
+                measurement_model.R,
+            )
+
+            classical_finite = (
+                np.all(np.isfinite(innovation_k))
+                and np.all(np.isfinite(classical_gain))
+                and np.all(np.isfinite(correction))
+                and np.all(np.isfinite(P))
+                and np.all(np.isfinite(nav.position_ecef_m))
+                and np.all(np.isfinite(nav.velocity_ecef_mps))
+            )
+            if not classical_finite:
+                debug_path = OUTPUT_DIR / "classical_failure_debug.npz"
+                np.savez_compressed(
+                    debug_path,
+                    failure_stage=np.asarray("classical_measurement_update"),
+                    fusion_index=np.asarray(fusion_index),
+                    time_gpst_s=np.asarray(t),
+                    n_measurements=np.asarray(n),
+                    sat_ids=np.asarray(current_sat_ids),
+                    innovation_m=innovation_k,
+                    gain=classical_gain,
+                    correction=correction,
+                    nav_position_ecef_m=nav.position_ecef_m,
+                    nav_velocity_ecef_mps=nav.velocity_ecef_mps,
+                    covariance=P,
+                )
+                raise FloatingPointError(
+                    "non-finite classical TC/KF diagnostic update; "
+                    f"diagnostics saved to {debug_path}"
+                )
+
+            nav = inject_error_state(nav, correction)
+            posterior_position = gnss_antenna_position(
+                nav, test_lever_arm_b_m
+            )
+            posterior_residual = build_innovation_only(
+                nav, measurements, test_lever_arm_b_m
+            )
+
+            truth_position = test_fusion_antenna_truth_position[fusion_index]
+            position_error_3d_m = float(
+                np.linalg.norm(posterior_position - truth_position)
+            )
+
+            if DEBUG_NUMERICS:
+                debug_trace.append({
+                    "fusion_index": int(fusion_index),
+                    "time_gpst_s": float(t),
+                    "n_measurements": int(n),
+                    "max_abs_innovation_m": (
+                        float(np.max(np.abs(innovation_k)))
+                        if innovation_k.size else 0.0
+                    ),
+                    "max_abs_gain": (
+                        float(np.max(np.abs(classical_gain)))
+                        if classical_gain.size else 0.0
+                    ),
+                    "correction_norm": float(np.linalg.norm(correction)),
+                    "position_norm_m": float(np.linalg.norm(nav.position_ecef_m)),
+                    "position_error_3d_m": position_error_3d_m,
+                    "covariance_max_abs": (
+                        float(np.max(np.abs(P))) if P.size else 0.0
+                    ),
+                })
+
+            counts = Counter(m.constellation for m in measurements)
+            online_rows.append({
+                "time": t,
+                "position": posterior_position.copy(),
+                "truth": truth_position.copy(),
+                "n_total": n,
+                "n_gnss": counts["G"] + counts["C"],
+                "n_leo": counts["L"],
+                "sat_ids": current_sat_ids,
+            })
+
+            if fusion_index % 500 == 0:
+                print(
+                    "classical debug:",
+                    f"fusion={fusion_index}/{len(test_gnss_epochs) - 1}",
+                    f"N={n}",
+                    f"max|innov|={np.max(np.abs(innovation_k)):.3f} m",
+                    f"|dx|={np.linalg.norm(correction):.3f}",
+                    f"pos_err_3d={position_error_3d_m:.3f} m",
+                )
+            continue
+
+        # Paper Eqs. (11)-(14) require previous-epoch residual/state context.
+        # Training drops its first history row, so one ordinary TC/KF update is
+        # used only to establish matching causal history. This completion is not
+        # specified by the paper and is excluded from reported test metrics.
+        if previous_online is None:
+            warm_error_state_pred = np.zeros(INS_STATE_DIM)
+            warm_correction, P, _ = kalman_measurement_update(
+                P,
+                measurement_model.innovation,
+                measurement_model.H,
+                measurement_model.R,
+            )
+            warm_error_state_post = warm_error_state_pred + warm_correction
+            nav = inject_error_state(nav, warm_correction)
+            warm_posterior_position = gnss_antenna_position(
+                nav, test_lever_arm_b_m
+            )
+            warm_posterior_residual = build_innovation_only(
+                nav, measurements, test_lever_arm_b_m
+            )
+            previous_online = {
+                "sat_ids": measurement_model.sat_ids,
+                "residual": warm_posterior_residual,
+                "x_pred": warm_error_state_pred.copy(),
+                "x_post": warm_error_state_post.copy(),
+                "accel": last_accel.copy(),
+                "gyro": last_gyro.copy(),
+            }
+            online_warm_start_time = t
+            continue
+
+        # Training normalization is still fixed from training only, but the
+        # Masked CLA gain head is slot-shared and therefore accepts the current
+        # measurement count directly.  No test observation is truncated, and no
+        # test statistic is used to refit normalization or retrain the model.
+        n = len(measurements)
+
+        current_sat_ids = measurement_model.sat_ids
+        innovation_now = measurement_model.innovation
+
+        innovation_k = np.asarray(innovation_now, dtype=float).copy()
+        current_mask = np.ones(n, dtype=bool)
+        residual_k = np.zeros(n)
+        residual_mask = np.zeros(n, dtype=bool)
+
+        delta_accel = last_accel - previous_online["accel"]
+        delta_gyro = last_gyro - previous_online["gyro"]
+        previous_state_innovation = (
+            previous_online["x_post"] - previous_online["x_pred"]
+        )
+        previous_state_residual = (
+            np.zeros(INS_STATE_DIM)
+            if previous_previous_x_post is None
+            else previous_online["x_post"] - previous_previous_x_post
+        )
+
+        previous_residual = dict(
+            zip(previous_online["sat_ids"], previous_online["residual"])
+        )
+        for slot, sat_id in enumerate(current_sat_ids):
+            if sat_id in previous_residual:
+                residual_k[slot] = previous_residual[sat_id]
+                residual_mask[slot] = True
+
+        fixed_k = np.concatenate([
+            delta_accel,
+            delta_gyro,
+            previous_state_residual,
+            previous_state_innovation,
+        ])
+        obs_k = np.stack([residual_k, innovation_k], axis=1)
+        channel_k = np.stack([residual_mask, current_mask], axis=1)
+
+        # Use training-only normalization. Do not fit anything on test data.
+        fixed_raw_k = fixed_k.copy()
+        obs_raw_k = obs_k.copy()
+
+        fixed_k = (fixed_k - fixed_mean) / fixed_std
+        obs_k = (
+            obs_k - obs_mean.reshape(1, 2)
+        ) / obs_std.reshape(1, 2)
+        obs_k = np.where(channel_k, obs_k, 0.0)
+
+        if DEBUG_NUMERICS:
+            pre_network_finite = (
+                np.all(np.isfinite(nav.position_ecef_m))
+                and np.all(np.isfinite(nav.velocity_ecef_mps))
+                and np.all(np.isfinite(P))
+                and np.all(np.isfinite(innovation_k))
+                and np.all(np.isfinite(fixed_raw_k))
+                and np.all(np.isfinite(obs_raw_k))
+                and np.all(np.isfinite(fixed_k))
+                and np.all(np.isfinite(obs_k))
+            )
+            if not pre_network_finite:
+                debug_path = OUTPUT_DIR / "online_failure_debug.npz"
+                np.savez_compressed(
+                    debug_path,
+                    failure_stage=np.asarray("before_network"),
+                    fusion_index=np.asarray(fusion_index),
+                    time_gpst_s=np.asarray(t),
+                    sat_ids=np.asarray(current_sat_ids),
+                    innovation_m=innovation_k,
+                    fixed_raw=fixed_raw_k,
+                    observations_raw=obs_raw_k,
+                    fixed_normalized=fixed_k,
+                    observations_normalized=obs_k,
+                    channel_mask=channel_k,
+                    nav_position_ecef_m=nav.position_ecef_m,
+                    nav_velocity_ecef_mps=nav.velocity_ecef_mps,
+                    covariance=P,
+                )
+                raise FloatingPointError(
+                    "non-finite online input/state before MaskedCLA; "
+                    f"diagnostics saved to {debug_path}"
+                )
+
+        with torch.inference_mode():
+            output = model(
+                torch.tensor(
+                    fixed_k[None],
+                    dtype=torch.float32,
+                    device=DEVICE,
+                ),
+                torch.tensor(
+                    obs_k[None],
+                    dtype=torch.float32,
+                    device=DEVICE,
+                ),
+                torch.tensor(
+                    current_mask[None],
+                    dtype=torch.bool,
+                    device=DEVICE,
+                ),
+                torch.tensor(
+                    channel_k[None],
+                    dtype=torch.bool,
+                    device=DEVICE,
+                ),
+            )
+            innovation_tensor = torch.tensor(
+                innovation_k[None],
+                dtype=torch.float32,
+                device=DEVICE,
+            )
+            correction = torch.bmm(
+                output.kalman_gain,
+                innovation_tensor.unsqueeze(-1),
+            ).squeeze(-1)[0]
+
+        gain = output.kalman_gain[0].cpu().numpy().astype(float)
+        correction = correction.cpu().numpy().astype(float)
+        learned_error_state_pred = np.zeros(INS_STATE_DIM)
+        learned_error_state_post = learned_error_state_pred + correction
+        active_gain = gain[:, :n]
+
+        # This run intentionally trains only rows 0:9. Never inject
+        # unsupervised accelerometer/gyro-bias corrections.
+        attention = output.attention[0].cpu().numpy().astype(float)
+        gain_finite = np.all(np.isfinite(active_gain))
+        correction_finite = np.all(np.isfinite(correction))
+        attention_finite = np.all(np.isfinite(attention))
+
+        if DEBUG_NUMERICS:
+            debug_trace.append({
+                "fusion_index": int(fusion_index),
+                "time_gpst_s": float(t),
+                "n_measurements": int(n),
+                "max_abs_innovation_m": float(np.max(np.abs(innovation_k))) if innovation_k.size else 0.0,
+                "max_abs_fixed_raw": float(np.max(np.abs(fixed_raw_k))) if fixed_raw_k.size else 0.0,
+                "max_abs_fixed_normalized": float(np.max(np.abs(fixed_k))) if fixed_k.size else 0.0,
+                "max_abs_obs_normalized": float(np.max(np.abs(obs_k))) if obs_k.size else 0.0,
+                "max_abs_gain": float(np.nanmax(np.abs(active_gain))) if active_gain.size else 0.0,
+                "correction_norm": float(np.linalg.norm(correction)) if correction_finite else float("nan"),
+                "position_norm_m": float(np.linalg.norm(nav.position_ecef_m)),
+                "covariance_max_abs": float(np.nanmax(np.abs(P))) if P.size else 0.0,
+            })
+
+        if not (gain_finite and correction_finite and attention_finite):
+            debug_path = OUTPUT_DIR / "online_failure_debug.npz"
+            np.savez_compressed(
+                debug_path,
+                failure_stage=np.asarray("network_output"),
+                fusion_index=np.asarray(fusion_index),
+                time_gpst_s=np.asarray(t),
+                n_measurements=np.asarray(n),
+                sat_ids=np.asarray(current_sat_ids),
+                innovation_m=innovation_k,
+                fixed_raw=fixed_raw_k,
+                observations_raw=obs_raw_k,
+                fixed_normalized=fixed_k,
+                observations_normalized=obs_k,
+                channel_mask=channel_k,
+                gain=active_gain,
+                correction=correction,
+                attention=attention,
+                nav_position_ecef_m=nav.position_ecef_m,
+                nav_velocity_ecef_mps=nav.velocity_ecef_mps,
+                covariance=P,
+            )
+
+            trace_path = OUTPUT_DIR / "online_debug_trace.csv"
+            if debug_trace:
+                with trace_path.open("w", newline="", encoding="utf-8") as stream:
+                    writer = csv.DictWriter(
+                        stream,
+                        fieldnames=list(debug_trace[0].keys()),
+                    )
+                    writer.writeheader()
+                    writer.writerows(debug_trace)
+
+            print("\n=== NUMERICAL FAILURE DIAGNOSTIC ===")
+            print("fusion_index:", fusion_index)
+            print("time_gpst_s:", t)
+            print("n_measurements:", n)
+            print("innovation finite:", np.all(np.isfinite(innovation_k)))
+            print("innovation min/max:", np.nanmin(innovation_k), np.nanmax(innovation_k))
+            print("fixed normalized finite:", np.all(np.isfinite(fixed_k)))
+            print("fixed normalized min/max:", np.nanmin(fixed_k), np.nanmax(fixed_k))
+            print("obs normalized finite:", np.all(np.isfinite(obs_k)))
+            print("obs normalized min/max:", np.nanmin(obs_k), np.nanmax(obs_k))
+            print("gain finite:", gain_finite)
+            print("gain min/max:", np.nanmin(active_gain), np.nanmax(active_gain))
+            print("correction finite:", correction_finite)
+            print("correction:", correction)
+            print("attention finite:", attention_finite)
+            print("debug npz:", debug_path)
+            print("debug trace:", trace_path)
+
+            raise FloatingPointError(
+                "non-finite learned gain/correction/attention during online fusion"
+            )
+        if not np.allclose(
+            active_gain[SUPERVISED_STATE_DIM:, :],
+            0.0,
+            atol=0.0,
+            rtol=0.0,
+        ):
+            raise RuntimeError(
+                "online model produced nonzero bias-gain rows although rows "
+                "9:15 must remain zero in the current supervised-state completion"
+            )
+
+        # KalmanNet correction itself is independent of R. R is retained only
+        # for this declared covariance-bookkeeping completion.
+        P = learned_gain_covariance_update(
+            P,
+            active_gain,
+            measurement_model.H,
+            measurement_model.R,
+        )
+        nav = inject_error_state(nav, correction)
+
+        posterior_position = gnss_antenna_position(
+            nav, test_lever_arm_b_m
+        )
+        posterior_residual = build_innovation_only(
+            nav, measurements, test_lever_arm_b_m
+        )
+
+        previous_previous_x_post = previous_online["x_post"].copy()
+        previous_online = {
+            "sat_ids": current_sat_ids,
+            "residual": posterior_residual.copy(),
+            "x_pred": learned_error_state_pred.copy(),
+            "x_post": learned_error_state_post.copy(),
+            "accel": last_accel.copy(),
+            "gyro": last_gyro.copy(),
+        }
+
+        counts = Counter(m.constellation for m in measurements)
+        online_rows.append({
+            "time": t,
+            "position": posterior_position.copy(),
+            "truth": test_fusion_antenna_truth_position[fusion_index].copy(),
+            "n_total": n,
+            "n_gnss": counts["G"] + counts["C"],
+            "n_leo": counts["L"],
+            "sat_ids": current_sat_ids,
+        })
+
+    # =========================================================================
+    # 11. TEST-DATASET EVALUATION
+    # =========================================================================
+    if not online_rows:
+        raise ValueError(
+            f"Online test pass ({TEST_UPDATE_MODE}) produced no usable test epochs; "
+            "cannot compute test navigation metrics"
+        )
+
+    online_time = np.asarray([row["time"] for row in online_rows])
+    estimate = np.stack([row["position"] for row in online_rows])
+    truth_aligned = np.stack([row["truth"] for row in online_rows])
+
+    ned_error = np.empty_like(estimate)
+    for i, (est, truth_i) in enumerate(zip(estimate, truth_aligned)):
+        lat, lon, _ = ecef_to_llh(truth_i)
+        ned_error[i] = c_ecef_to_ned(lat, lon) @ (est - truth_i)
+
+    error_3d = np.linalg.norm(ned_error, axis=1)
+    rmse_ned = np.sqrt(np.mean(ned_error**2, axis=0))
+    rmse_3d = float(np.sqrt(np.mean(error_3d**2)))
+    rmse = np.append(rmse_ned, rmse_3d)
+    cdf_probability = np.arange(1, len(error_3d) + 1) / len(error_3d)
+
+    if DEBUG_NUMERICS and debug_trace:
+        trace_filename = (
+            "classical_debug_trace.csv"
+            if TEST_UPDATE_MODE == "classical_debug"
+            else "online_debug_trace.csv"
+        )
+        trace_path = OUTPUT_DIR / trace_filename
+        with trace_path.open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(
+                stream,
+                fieldnames=list(debug_trace[0].keys()),
+            )
+            writer.writeheader()
+            writer.writerows(debug_trace)
+
+    evaluation_filename = (
+        "classical_test_evaluation.npz"
+        if TEST_UPDATE_MODE == "classical_debug"
+        else "test_evaluation.npz"
+    )
+    trajectory_filename = (
+        "classical_test_trajectory.csv"
+        if TEST_UPDATE_MODE == "classical_debug"
+        else "test_trajectory.csv"
+    )
+    summary_filename = (
+        "classical_summary.json"
+        if TEST_UPDATE_MODE == "classical_debug"
+        else "summary.json"
+    )
+
+    np.savez(
+        OUTPUT_DIR / evaluation_filename,
+        dataset_dir=np.asarray(str(test_dataset_dir)),
+        test_update_mode=np.asarray(TEST_UPDATE_MODE),
+        time_gpst_s=online_time,
+        estimate_ecef_m=estimate,
+        truth_ecef_m=truth_aligned,
+        ned_error_m=ned_error,
+        error_3d_m=error_3d,
+        rmse_north_east_down_3d_m=rmse,
+        cdf_probability=cdf_probability,
+        north_cdf_absolute_error_m=np.sort(np.abs(ned_error[:, 0])),
+        east_cdf_absolute_error_m=np.sort(np.abs(ned_error[:, 1])),
+        down_cdf_absolute_error_m=np.sort(np.abs(ned_error[:, 2])),
+        three_d_cdf_error_m=np.sort(error_3d),
+    )
+
+    with (
+        OUTPUT_DIR / trajectory_filename
+    ).open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow([
+            "time_gpst_s",
+            "n_k",
+            "n_gnss",
+            "n_leo",
+            "sat_ids",
+            "x_ecef_m",
+            "y_ecef_m",
+            "z_ecef_m",
+        ])
+        for row in online_rows:
+            writer.writerow([
+                row["time"],
+                row["n_total"],
+                row["n_gnss"],
+                row["n_leo"],
+                ";".join(row["sat_ids"]),
+                *row["position"].tolist(),
+            ])
+
+    summary = {
+        "paper_exact": False,
+        "test_update_mode": TEST_UPDATE_MODE,
+        "diagnostic_classical_control": TEST_UPDATE_MODE == "classical_debug",
+        "dataset_protocol": {
+            "training_dataset": str(TRAIN_DATASET_DIR),
+            "test_dataset": str(test_dataset_dir),
+            "test_used_for_training": False,
+            "normalization_source": "training_dataset_only",
+        },
+        "measurement_mode": "pseudorange_only",
+        "orbit_source": "TLE/SGP4",
+        "leo_pseudorange_error_model": (
+            "Yan_Eqs_1_to_3_Ref35_iono_tropo_MP_residuals_no_URA_no_receiver_noise"
+        ),
+        "leo_ura_enabled": False,
+        "leo_receiver_noise_enabled": False,
+        "fde_dia_enabled": False,
+        "training_nmax": int(nmax),
+        "test_sequence_length_policy": "dynamic_all_valid_measurements_no_truncation",
+        "feature_protocol": {
+            "timing": "causal_lagged",
+            "state_innovation": "previous_x_post_minus_previous_x_pred",
+            "state_residual": "previous_x_post_minus_previous_previous_x_post",
+            "closed_loop_error_state_prior": "zero_after_feedback_reset",
+            "observation_layout": "fixed_36_plus_per_satellite_[previous_residual,current_innovation]",
+            "observation_layout_status": "project_specific_tensorization; paper does not publish exact reshape",
+            "test_nmax_policy": "dynamic_sequence_length_with_shared_gain_head",
+        },
+        "masked_cla_protocol": {
+            "used_for_current_test_update": TEST_UPDATE_MODE == "masked_kalmannet",
+            "paper_supported_core": "masked_Conv1D_then_5_layer_LSTM_then_masked_attention",
+            "table_III": {
+                "conv_filters": 24,
+                "kernel_completion": 3,
+                "stride": 1,
+                "activation": "ReLU",
+                "lstm_units": 64,
+                "lstm_hidden_layers": 5,
+                "dropout": 0.2,
+                "optimizer": "Adam",
+                "initial_learning_rate": LEARNING_RATE,
+            },
+            "pooling": "omitted_because_Fig8_shows_it_but_parameters_are_not_published",
+            "gain_output_shape": "[15,N_current] at inference; [15,training_Nmax] for padded training batches",
+            "gain_head_completion": "shared_per_satellite_head_to_avoid_test_Nmax_leakage_or_truncation",
+            "learned_gain_rows": "0:9_position_velocity_attitude",
+            "forced_zero_gain_rows": "9:15_accelerometer_and_gyro_bias",
+            "imu_error_output": "six_dimensional_zero_placeholder_not_trained_or_used",
+            "training_status": "project_completion_not_paper_exact_end_to_end",
+            "alternating_optimization": False,
+        },
+        "test_causal_warm_start": {
+            "method": (
+                "not_applicable_classical_TC_KF_used_at_every_epoch"
+                if TEST_UPDATE_MODE == "classical_debug"
+                else "one_classical_TC_KF_update"
+            ),
+            "time_gpst_s": (
+                None
+                if online_warm_start_time is None
+                else float(online_warm_start_time)
+            ),
+            "included_in_reported_test_metrics": (
+                True if TEST_UPDATE_MODE == "classical_debug" else False
+            ),
+        },
+        "orchestration_audit": {
+            "adopted": [
+                "validated_IMR_TOW_to_GPST_week_anchoring",
+                "strict_monotonic_time_axis_checks",
+                "central_exact_fusion_event_scheduler",
+            ],
+            "not_adopted": [
+                "old_single_truth_reference_handling",
+                "old_iid_LEO_measurement_noise_and_ideal_atmosphere_path",
+                "position_only_supervised_arrays_with_full_15_row_gain",
+                "single_config_online_evaluation_without_explicit_second_dataset",
+                "zero_history_first_learned_update_from_standalone_online_module",
+            ],
+        },
+        "online_update_protocol": {
+            "mode": TEST_UPDATE_MODE,
+            "state_correction": (
+                "dx_equals_classical_K_times_innovation"
+                if TEST_UPDATE_MODE == "classical_debug"
+                else "dx_equals_Knet_times_raw_innovation"
+            ),
+            "measurement_covariance_used_to_compute_gain": (
+                True if TEST_UPDATE_MODE == "classical_debug" else False
+            ),
+            "covariance_update": (
+                "classical_Joseph_update_inside_kalman_measurement_update"
+                if TEST_UPDATE_MODE == "classical_debug"
+                else "Joseph_update_with_learned_gain_STANDARD_COMPLETION"
+            ),
+            "learned_network_bypassed": TEST_UPDATE_MODE == "classical_debug",
+            "bias_gain_rows_9_to_15_forced_zero": True,
+            "receiver_clock_handling": "epochwise_WLS_nuisance_projected_from_innovation_H_R",
+            "standalone_online_zero_history_first_epoch_adopted": False,
+        },
+        "runtime_accuracy_tradeoff": {
+            "so3_exponential": "closed_form_Rodrigues_exact",
+            "van_loan": {
+                "taylor_order": VAN_LOAN_TAYLOR_ORDER,
+                "max_norm_1_fast_path": VAN_LOAN_TAYLOR_MAX_NORM_1,
+                "taylor_calls": int(_VAN_LOAN_STATS["taylor_calls"]),
+                "exact_fallback_calls": int(_VAN_LOAN_STATS["exact_fallback_calls"]),
+                "max_norm_1_seen": float(_VAN_LOAN_STATS["max_norm_1"]),
+                "max_taylor_remainder_bound": float(_VAN_LOAN_STATS["max_taylor_remainder_bound"]),
+                "validation_calls": int(_VAN_LOAN_STATS["validation_calls"]),
+                "max_validation_phi_abs": float(_VAN_LOAN_STATS["max_validation_phi_abs"]),
+                "max_validation_qd_abs": float(_VAN_LOAN_STATS["max_validation_qd_abs"]),
+            },
+            "leo_receive_time_prefilter": {
+                "guard_deg": LEO_PREFILTER_GUARD_DEG,
+                "training_checked": (
+                    None if leo_simulator is None else int(leo_simulator.prefilter_checked)
+                ),
+                "training_rejected": (
+                    None if leo_simulator is None else int(leo_simulator.prefilter_rejected)
+                ),
+                "test_checked": int(test_leo_simulator.prefilter_checked),
+                "test_rejected": int(test_leo_simulator.prefilter_rejected),
+                "final_mask_deg_unchanged": LEO_MIN_ELEVATION_DEG,
+            },
+        },
+        "test_online_epochs": len(online_rows),
+        "test_rmse_m": {
+            "north": float(rmse[0]),
+            "east": float(rmse[1]),
+            "down": float(rmse[2]),
+            "three_d": float(rmse[3]),
+        },
+        "limitations": [
+            "Paper uses pseudorange + pseudorange-rate; this project is pseudorange-only.",
+            "Paper uses STK/HPOP LEO orbits; this project uses TLE/SGP4.",
+            "LEO clock terms remain ideal zero because the paper does not publish a reproducible simulated LEO clock-error generator.",
+            "By project choice, LEO MP/NLOS uses Ref. [35] Eq. (18) multipath sigma rather than Yan et al. Eq. (4)/empirical non-Gaussian injection; URA and receiver noise are omitted.",
+            "Independent zero-mean Gaussian draws realize the Ref. [35] ionosphere, troposphere, and multipath residual sigmas.",
+            "The paper uses a random LEO masking-angle model [43]; this project still uses a fixed minimum elevation mask.",
+            "FDE-DIA Eqs. (33)-(34) is intentionally not implemented.",
+            "The IE postprocessed truth provides position, velocity, and attitude but not accelerometer/gyro bias truth; both classical history/warm-start and Masked CLA measurement updates therefore keep nominal bias states frozen while propagating the full 15-state covariance.",
+            (
+                "Classical diagnostic mode applies the classical TC/KF measurement update at every usable Data02 fusion epoch; this control run is for isolating learned closed-loop divergence and is not a Masked KalmanNet result."
+                if TEST_UPDATE_MODE == "classical_debug"
+                else "The first test fusion epoch is a classical TC/KF warm-start used only to form the previous-epoch causal features required by Eqs. (11)-(14); reported test metrics begin with the following learned-update epoch."
+            ),
+            "The standalone online.py applies the learned model even when no previous causal snapshot exists by allowing zero history features; this behavior is intentionally not adopted because training discards the first history row.",
+            "Yan et al. do not publish an explicit posterior covariance equation for a learned KG. Joseph covariance propagation with K_net and R is retained only as a declared bookkeeping completion; R is not an input to the learned gain or learned state correction.",
+            "The causal-lagged feature timing and fixed-36 plus per-satellite two-channel tensorization are implementation completions because Yan et al. do not publish enough tensor-layout detail to reconstruct them uniquely.",
+            "Fig. 8 depicts pooling inside the masked CNN block, but the paper publishes no pooling type, kernel, or stride; no pooling operator is guessed in this reproduction.",
+            "The paper states that the FC output includes inertial-measurement-error estimation, but no reproducible output definition, target, or use is published; this run returns an explicit zero placeholder and does not use it for navigation.",
+            "The paper states end-to-end supervised training and alternating optimization, but does not publish enough implementation detail to reproduce that training schedule uniquely; this run uses independent-epoch supervised training as an explicit completion.",
+            "Because the current independent-epoch loss cannot safely train a full 15-row gain from position labels alone, the available postprocessed position/velocity/attitude truth supervises rows 0:9 and bias rows 9:15 are forced to zero.",
+            "The paper defines zero-padding with Nmax from the training dataset but does not specify behavior when an independent test epoch has more observations than that Nmax. This run uses a declared shared per-satellite gain-head completion so every valid test observation is retained without using test labels/statistics for training or normalization.",
+            "Exact fusion scheduling now uses the validated orchestration.py event scheduler; its current-sample IMU zero-order-hold convention remains a documented standard completion because the paper does not publish the raw IMU interpolation/hold rule.",
+            "Runtime trade-off: Van Loan exp(A*dt) uses Taylor order 10 only when ||A*dt||_1 <= 0.2, with exact SciPy expm fallback otherwise; several early fast-path calls are regression-checked against SciPy expm.",
+            "Runtime trade-off: LEOs clearly below the final 10-degree mask at receive time are prefiltered using a 0.5-degree guard; all remaining candidates still use the original transmit-time iteration and exact final mask.",
+        ],
+    }
+    (
+        OUTPUT_DIR / summary_filename
+    ).write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    print("\n=== FINISHED INDEPENDENT TEST ===")
+    print("test dataset:", test_dataset_dir)
+    print("test update mode:", TEST_UPDATE_MODE)
+    print("test RMSE [N, E, D, 3D] m:", rmse)
+    print("evaluation file:", OUTPUT_DIR / evaluation_filename)
+    print("trajectory file:", OUTPUT_DIR / trajectory_filename)
+    print("summary file:", OUTPUT_DIR / summary_filename)
+    if DEBUG_NUMERICS and debug_trace:
+        print("debug trace:", trace_path)
+    print("outputs:", OUTPUT_DIR.resolve())
+    print(
+        "Van Loan fast/fallback calls:",
+        _VAN_LOAN_STATS["taylor_calls"],
+        "/",
+        _VAN_LOAN_STATS["exact_fallback_calls"],
+    )
+    print(
+        "Van Loan max ||A*dt||_1 / remainder bound:",
+        f"{_VAN_LOAN_STATS['max_norm_1']:.6g}",
+        "/",
+        f"{_VAN_LOAN_STATS['max_taylor_remainder_bound']:.3e}",
+    )
+    print(
+        "Van Loan validation max |dPhi| / |dQd|:",
+        f"{_VAN_LOAN_STATS['max_validation_phi_abs']:.3e}",
+        "/",
+        f"{_VAN_LOAN_STATS['max_validation_qd_abs']:.3e}",
+    )
+    training_prefilter_text = (
+        "skipped"
+        if leo_simulator is None
+        else f"{leo_simulator.prefilter_rejected}/{leo_simulator.prefilter_checked}"
+    )
+    print(
+        "LEO prefilter rejected train/test:",
+        training_prefilter_text,
+        "/",
+        f"{test_leo_simulator.prefilter_rejected}/{test_leo_simulator.prefilter_checked}",
+    )
+    print(f"total wall runtime: {perf_counter() - _run_wall_start:.3f} s")
