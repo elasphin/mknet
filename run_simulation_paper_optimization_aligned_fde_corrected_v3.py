@@ -4091,16 +4091,16 @@ if __name__ == "__main__":
     OUTPUT_DIR = _default_output_dir()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    MAX_FUSION_EPOCHS = None
-    MAX_TEST_FUSION_EPOCHS = None
+    MAX_FUSION_EPOCHS = 100
+    MAX_TEST_FUSION_EPOCHS = 100
 
     # Table III explicitly gives Adam, initial LR=0.01, Conv=24,
     # LSTM=64 x 5, and dropout=0.2. Fig. 15 displays learning curves extending
     # to roughly 500 training epochs, but the text does not publish an exact
     # stopping epoch. Therefore 500 is used only as a maximum figure-guided
     # training horizon.
-    TRAINING_EPOCHS = 500
-    BATCH_SIZE = 32  # unpublished; explicit reproducibility completion
+    TRAINING_EPOCHS = 10
+    BATCH_SIZE = 16  # unpublished; explicit reproducibility completion
     LEARNING_RATE = 0.01
     # Ref. [15] permits separate learning rates for its two alternating blocks,
     # but Yan et al. publish only one initial learning rate (0.01). To avoid an
@@ -4120,7 +4120,7 @@ if __name__ == "__main__":
     # epochs are strongly correlated; a random split would leak near-duplicate
     # temporal context between train and validation.
     VALIDATION_FRACTION = 0.20
-    EARLY_STOP_PATIENCE = 25
+    EARLY_STOP_PATIENCE = 5
     EARLY_STOP_MIN_DELTA = 0.0
 
     # Keep the paper-supported Adam initial LR fixed. No unpublished LR scheduler
