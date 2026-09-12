@@ -10,6 +10,17 @@ Dataset protocol:
 - Validation/early stopping are reproducibility safeguards: the paper does not publish
   an internal validation protocol or early-stopping rule, so these are explicitly marked
   project completions rather than paper-exact training details.
+- Before Data02 is opened, the selected checkpoint must pass a recursive Data01
+  acceptance gate against the classical TC trajectory on the same epochs. This
+  gate and its first-violation trace are STANDARD-COMPLETION safeguards; no
+  Data02 statistic or hand-tuned metric threshold is used for model acceptance.
+- Eq. (30) errors for position, velocity, and attitude are made dimensionless
+  with train-only group RMS values. Yan et al. do not publish their unit-balancing
+  rule; this STANDARD-COMPLETION prevents squared metres from hiding radian-scale
+  attitude failures without using validation or test statistics.
+- The unpublished Masked-FC gain-head initialization is set to exact zero so an
+  untrained random gain cannot inject an arbitrary navigation correction. Adam
+  and the paper-supported initial learning rate still train every head parameter.
 
 Intentional project differences from Yan et al. (2026) that are still retained:
 - pseudorange-only (no pseudorange-rate/Doppler)
@@ -1709,6 +1720,63 @@ def effective_gravity_ecef(position_ecef_m: Array) -> Array:
     return _gravitation_j2_ecef(r) - np.cross(OMEGA_IE_E, np.cross(OMEGA_IE_E, r))
 
 
+def effective_gravity_gradient_ecef(position_ecef_m: Array) -> Array:
+    """Analytic position Jacobian of ``effective_gravity_ecef``.
+
+    The previous radial-only approximation omitted the transverse central-
+    gravity terms, the J2 derivatives, and the centrifugal derivative. Those
+    terms belong in the velocity/position block of the ECEF error dynamics.
+    This closed form is equivalent to differentiating the mechanization's
+    gravity function and avoids six extra gravity evaluations per IMU sample.
+    """
+    position = np.asarray(position_ecef_m, dtype=float).reshape(3)
+    x, y, z = position
+    radius_squared = float(position @ position)
+    if not np.isfinite(radius_squared) or radius_squared <= 0.0:
+        raise ValueError("gravity gradient requires a finite nonzero ECEF position")
+
+    radius = math.sqrt(radius_squared)
+    inverse_radius_3 = radius ** -3
+    inverse_radius_5 = radius ** -5
+    inverse_radius_squared = 1.0 / radius_squared
+    inverse_radius_4 = inverse_radius_squared**2
+    inverse_radius_6 = inverse_radius_squared**3
+    z_squared = z * z
+    k = 1.5 * J2_UNITLESS * EARTH_SEMI_MAJOR_AXIS_M**2
+
+    xy_factor = 1.0 + k * inverse_radius_squared - 5.0 * k * z_squared * inverse_radius_4
+    z_factor = 1.0 + 3.0 * k * inverse_radius_squared - 5.0 * k * z_squared * inverse_radius_4
+    factors = np.asarray([xy_factor, xy_factor, z_factor])
+
+    grad_xy_factor = np.asarray(
+        [
+            -2.0 * k * x * inverse_radius_4 + 20.0 * k * z_squared * x * inverse_radius_6,
+            -2.0 * k * y * inverse_radius_4 + 20.0 * k * z_squared * y * inverse_radius_6,
+            -12.0 * k * z * inverse_radius_4 + 20.0 * k * z**3 * inverse_radius_6,
+        ]
+    )
+    grad_z_factor = np.asarray(
+        [
+            -6.0 * k * x * inverse_radius_4 + 20.0 * k * z_squared * x * inverse_radius_6,
+            -6.0 * k * y * inverse_radius_4 + 20.0 * k * z_squared * y * inverse_radius_6,
+            -16.0 * k * z * inverse_radius_4 + 20.0 * k * z**3 * inverse_radius_6,
+        ]
+    )
+    factor_gradient = np.vstack(
+        [grad_xy_factor, grad_xy_factor, grad_z_factor]
+    )
+
+    gravitation_gradient = -EARTH_GRAVITATIONAL_PARAMETER_M3PS2 * (
+        np.diag(factors) * inverse_radius_3
+        - 3.0 * np.outer(position, position) * factors[:, None] * inverse_radius_5
+        + position[:, None] * factor_gradient * inverse_radius_3
+    )
+    centrifugal_gradient = np.diag(
+        [EARTH_ROTATION_RATE_RADPS**2, EARTH_ROTATION_RATE_RADPS**2, 0.0]
+    )
+    return gravitation_gradient + centrifugal_gradient
+
+
 
 @lru_cache(maxsize=128)
 def _earth_rotation_transition(dt_s: float) -> Array:
@@ -2052,13 +2120,9 @@ def build_error_state_dynamics(nav: NavigationState, specific_force_body_mps2: A
     from attitude and accelerometer-bias errors has the signs used below.
     """
     F = np.zeros((INS_STATE_DIM, INS_STATE_DIM))
-    r_e = nav.position_ecef_m
-    radius = float(np.linalg.norm(r_e))
-    gravity = _gravitation_j2_ecef(r_e)
-    radial = r_e / radius
     C = nav.body_to_ecef_dcm
     F[0:3, 3:6] = np.eye(3)
-    F[3:6, 0:3] = -(2.0 / radius) * np.outer(gravity, radial)
+    F[3:6, 0:3] = effective_gravity_gradient_ecef(nav.position_ecef_m)
     F[3:6, 3:6] = -2.0 * OMEGA_IE_SKEW
     F[3:6, 6:9] = _skew(C @ np.asarray(specific_force_body_mps2))
     F[3:6, 9:12] = -C
@@ -2824,6 +2888,187 @@ def _accumulate_fde_stats(stats: dict, result: Ref33FDEResult) -> None:
         stats["identified_by_constellation"][constellation] += 1
 
 
+def training_state_group_rms_scales(
+    target_states_9: Array,
+    train_indices: Array,
+) -> Array:
+    """Return train-only RMS scales for position, velocity, and attitude.
+
+    Eq. (30) does not publish a unit-balancing rule. Directly adding squared
+    metres, squared metres/second, and squared radians made radian errors nearly
+    invisible in practice. This STANDARD-COMPLETION uses no validation/test
+    values and no hand-tuned physical constant: each physical state group is
+    divided by the RMS Euclidean norm of that group in Data01-train.
+    """
+    targets = np.asarray(target_states_9, dtype=float)
+    indices = np.asarray(train_indices, dtype=int).reshape(-1)
+    if targets.ndim != 2 or targets.shape[1] != SUPERVISED_STATE_DIM:
+        raise ValueError("target_states_9 must have shape [T,9]")
+    if indices.size == 0 or np.any(indices < 0) or np.any(indices >= len(targets)):
+        raise ValueError("train_indices must select at least one valid target row")
+    selected = targets[indices]
+    if not np.all(np.isfinite(selected)):
+        raise ValueError("training state targets contain non-finite values")
+
+    scales = np.asarray(
+        [
+            np.sqrt(np.mean(np.sum(selected[:, 0:3] ** 2, axis=1))),
+            np.sqrt(np.mean(np.sum(selected[:, 3:6] ** 2, axis=1))),
+            np.sqrt(np.mean(np.sum(selected[:, 6:9] ** 2, axis=1))),
+        ]
+    )
+    numerical_floor = 100.0 * np.finfo(float).eps
+    if np.any(scales <= numerical_floor):
+        raise ValueError(
+            "a supervised state group has zero train-only RMS and cannot be "
+            "unit-balanced without inventing a scale"
+        )
+    return scales
+
+
+def assess_recursive_stability(
+    learned_position_errors_ecef_m: Array,
+    classical_position_errors_ecef_m: Array,
+    max_abs_normalized_feature_by_epoch: Array,
+    offline_data01_max_abs_normalized_feature: float,
+) -> dict:
+    """Assess a learned rollout against Data01 references without test leakage.
+
+    This is a STANDARD-COMPLETION, not a threshold published by Yan et al. The
+    learned checkpoint is accepted for independent testing only when its Data01
+    recursive position RMSE and maximum position error are no worse than the
+    classical TC trajectory on exactly the same evaluated epochs. Consequently,
+    no hand-tuned metric limit and no Data02 statistic enters the decision.
+
+    The offline feature-support comparison is diagnostic only. It identifies the
+    first epoch at which recursive features leave the range seen in the complete
+    teacher-forced Data01 record, but it does not independently reject a model.
+    """
+    learned = np.asarray(learned_position_errors_ecef_m, dtype=float)
+    classical = np.asarray(classical_position_errors_ecef_m, dtype=float)
+    feature_max = np.asarray(
+        max_abs_normalized_feature_by_epoch, dtype=float
+    ).reshape(-1)
+    offline_support = float(offline_data01_max_abs_normalized_feature)
+
+    if (
+        learned.ndim != 2
+        or learned.shape[1] != 3
+        or classical.shape != learned.shape
+        or feature_max.shape != (len(learned),)
+        or len(learned) == 0
+    ):
+        raise ValueError(
+            "recursive/classical stability arrays must have shapes [T,3], "
+            "[T,3], and [T] with T > 0"
+        )
+    if (
+        not np.all(np.isfinite(learned))
+        or not np.all(np.isfinite(classical))
+        or not np.all(np.isfinite(feature_max))
+        or not math.isfinite(offline_support)
+        or offline_support < 0.0
+    ):
+        raise ValueError("stability assessment inputs must be finite")
+
+    learned_norm = np.linalg.norm(learned, axis=1)
+    classical_norm = np.linalg.norm(classical, axis=1)
+    learned_rmse = float(np.sqrt(np.mean(learned_norm**2)))
+    classical_rmse = float(np.sqrt(np.mean(classical_norm**2)))
+    learned_max = float(np.max(learned_norm))
+    classical_max = float(np.max(classical_norm))
+
+    rmse_tolerance = (
+        100.0 * np.finfo(float).eps * max(classical_rmse, 1.0)
+    )
+    max_tolerance = (
+        100.0 * np.finfo(float).eps * max(classical_max, 1.0)
+    )
+    rmse_not_worse = learned_rmse <= classical_rmse + rmse_tolerance
+    max_not_worse = learned_max <= classical_max + max_tolerance
+
+    position_violation = np.flatnonzero(
+        learned_norm > classical_max + max_tolerance
+    )
+    same_epoch_tolerance = (
+        100.0
+        * np.finfo(float).eps
+        * np.maximum(classical_norm, 1.0)
+    )
+    same_epoch_degradation = np.flatnonzero(
+        learned_norm > classical_norm + same_epoch_tolerance
+    )
+    feature_tolerance = (
+        100.0 * np.finfo(float).eps * max(offline_support, 1.0)
+    )
+    feature_violation = np.flatnonzero(
+        feature_max > offline_support + feature_tolerance
+    )
+
+    first_position_violation_index = (
+        None if position_violation.size == 0 else int(position_violation[0])
+    )
+    first_same_epoch_degradation_index = (
+        None
+        if same_epoch_degradation.size == 0
+        else int(same_epoch_degradation[0])
+    )
+    first_feature_violation_index = (
+        None if feature_violation.size == 0 else int(feature_violation[0])
+    )
+    candidate_indices = [
+        index
+        for index in (
+            first_position_violation_index,
+            first_same_epoch_degradation_index,
+            first_feature_violation_index,
+        )
+        if index is not None
+    ]
+    first_reference_violation_index = (
+        None if not candidate_indices else int(min(candidate_indices))
+    )
+
+    reason_codes = []
+    if not rmse_not_worse:
+        reason_codes.append("recursive_rmse_worse_than_same_epoch_classical_TC")
+    if not max_not_worse:
+        reason_codes.append(
+            "recursive_max_position_error_worse_than_same_epoch_classical_TC"
+        )
+
+    return {
+        "accepted_for_independent_test": bool(
+            rmse_not_worse and max_not_worse
+        ),
+        "reason_codes": reason_codes,
+        "evaluated_epochs": int(len(learned)),
+        "learned_rmse_3d_m": learned_rmse,
+        "classical_same_epoch_rmse_3d_m": classical_rmse,
+        "learned_max_position_error_m": learned_max,
+        "classical_same_epoch_max_position_error_m": classical_max,
+        "rmse_not_worse_than_classical": bool(rmse_not_worse),
+        "max_error_not_worse_than_classical": bool(max_not_worse),
+        "offline_data01_max_abs_normalized_feature": offline_support,
+        "recursive_max_abs_normalized_feature": float(np.max(feature_max)),
+        "first_position_envelope_violation_index": (
+            first_position_violation_index
+        ),
+        "first_same_epoch_classical_degradation_index": (
+            first_same_epoch_degradation_index
+        ),
+        "first_offline_feature_support_violation_index": (
+            first_feature_violation_index
+        ),
+        "first_reference_violation_index": first_reference_violation_index,
+        "acceptance_reference": (
+            "same_Data01_epochs_classical_TC_no_Data02_statistics"
+        ),
+        "feature_support_role": "diagnostic_only_not_acceptance_threshold",
+        "status": "STANDARD_COMPLETION_Yan_acceptance_gate_unpublished",
+    }
+
+
 def _validate_ref33_statistical_core(
     alpha: float,
     *,
@@ -3489,6 +3734,40 @@ SUPERVISED_STATE_DIM = NAVIGATION_CORRECTION_DIM  # [position, velocity, attitud
 MASK_NORMALIZATION_EPS = 1e-6
 
 
+def normalized_feature_group_maxima(
+    fixed_normalized: Array,
+    observations_normalized: Array,
+) -> dict[str, float]:
+    """Split one normalized Masked-CLA input into interpretable feature groups."""
+    fixed_values = np.asarray(fixed_normalized, dtype=float).reshape(-1)
+    observation_values = np.asarray(observations_normalized, dtype=float)
+    if fixed_values.shape != (FIXED_FEATURE_DIM,):
+        raise ValueError("normalized fixed feature must have shape [36]")
+    if observation_values.ndim != 2 or observation_values.shape[1] != 2:
+        raise ValueError("normalized observation feature must have shape [N,2]")
+    if (
+        not np.all(np.isfinite(fixed_values))
+        or not np.all(np.isfinite(observation_values))
+    ):
+        raise ValueError("normalized feature groups must be finite")
+
+    def _max_abs(values: Array) -> float:
+        return 0.0 if values.size == 0 else float(np.max(np.abs(values)))
+
+    return {
+        "normalized_delta_accel_max_abs": _max_abs(fixed_values[0:3]),
+        "normalized_delta_gyro_max_abs": _max_abs(fixed_values[3:6]),
+        "normalized_state_residual_max_abs": _max_abs(fixed_values[6:21]),
+        "normalized_state_innovation_max_abs": _max_abs(fixed_values[21:36]),
+        "normalized_observation_residual_max_abs": _max_abs(
+            observation_values[:, 0]
+        ),
+        "normalized_observation_innovation_max_abs": _max_abs(
+            observation_values[:, 1]
+        ),
+    }
+
+
 @dataclass(frozen=True)
 class MaskedCLAOutput:
     """One Masked-CLA forward pass.
@@ -3772,6 +4051,14 @@ class MaskedCLA(nn.Module):
             2 * 64,
             SUPERVISED_STATE_DIM,
         )
+        # Yan et al. do not publish FC initialization. A random untrained gain
+        # creates metre/second/radian feedback before the first optimization
+        # step and was observed to drive the recursive features immediately out
+        # of their Data01 support. Zero output is the conservative deterministic
+        # STANDARD-COMPLETION: training gradients still update the linear head,
+        # while the initial network cannot inject an arbitrary state correction.
+        nn.init.zeros_(self.gain_head.weight)
+        nn.init.zeros_(self.gain_head.bias)
 
         # Fig. 8 explicitly produces eta_k in addition to KG_k.  Fig. 2 feeds an
         # IMU-error correction into the INS error-compensation path and Eq. (8)
@@ -4030,9 +4317,10 @@ def fig8_post_update_error_state_9(
     -------
     linear_error_6 : [B,6]
         Remaining position/velocity error after the learned state update.
-    attitude_angle_rad : [B]
-        Geodesic attitude error magnitude. Its square equals the squared norm of
-        the residual attitude rotation vector required by the 9-state Eq. (30).
+    attitude_rotation_vector_rad : [B,3]
+        Principal SO(3) residual rotation vector. Its norm is the geodesic
+        attitude error and its components allow train-only unit balancing of
+        roll, pitch, and heading error-state directions.
     """
     if estimated_error_state_15.ndim != 2:
         raise ValueError("estimated_error_state_15 must have shape [B,15]")
@@ -4051,8 +4339,6 @@ def fig8_post_update_error_state_9(
     residual_relative = true_relative @ estimated_relative.transpose(1, 2)
 
     # Robust principal rotation angle using atan2(|sin(theta)|, cos(theta)).
-    # This is the geodesic norm of the residual attitude rotation vector, so
-    # angle^2 is exactly its contribution to ||x_k - xhat_k||_2^2.
     vee = torch.stack(
         [
             residual_relative[:, 2, 1] - residual_relative[:, 1, 2],
@@ -4069,7 +4355,18 @@ def fig8_post_update_error_state_9(
         sin_theta,
         cos_theta.clamp(-1.0, 1.0),
     )
-    return linear_error_6, attitude_angle
+    small = attitude_angle < 1e-5
+    small_factor = (
+        0.5
+        + attitude_angle**2 / 12.0
+        + 7.0 * attitude_angle**4 / 720.0
+    )
+    regular_factor = attitude_angle / (
+        2.0 * sin_theta.clamp_min(1e-12)
+    )
+    factor = torch.where(small, small_factor, regular_factor)
+    attitude_rotation_vector = factor.unsqueeze(1) * vee
+    return linear_error_6, attitude_rotation_vector
 
 
 # =============================================================================
@@ -4091,16 +4388,16 @@ if __name__ == "__main__":
     OUTPUT_DIR = _default_output_dir()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    MAX_FUSION_EPOCHS = 100
-    MAX_TEST_FUSION_EPOCHS = 100
+    MAX_FUSION_EPOCHS = None
+    MAX_TEST_FUSION_EPOCHS = None
 
     # Table III explicitly gives Adam, initial LR=0.01, Conv=24,
     # LSTM=64 x 5, and dropout=0.2. Fig. 15 displays learning curves extending
     # to roughly 500 training epochs, but the text does not publish an exact
     # stopping epoch. Therefore 500 is used only as a maximum figure-guided
     # training horizon.
-    TRAINING_EPOCHS = 10
-    BATCH_SIZE = 16  # unpublished; explicit reproducibility completion
+    TRAINING_EPOCHS = 500
+    BATCH_SIZE = 32  # unpublished; explicit reproducibility completion
     LEARNING_RATE = 0.01
     # Ref. [15] permits separate learning rates for its two alternating blocks,
     # but Yan et al. publish only one initial learning rate (0.01). To avoid an
@@ -4120,7 +4417,7 @@ if __name__ == "__main__":
     # epochs are strongly correlated; a random split would leak near-duplicate
     # temporal context between train and validation.
     VALIDATION_FRACTION = 0.20
-    EARLY_STOP_PATIENCE = 5
+    EARLY_STOP_PATIENCE = 25
     EARLY_STOP_MIN_DELTA = 0.0
 
     # Keep the paper-supported Adam initial LR fixed. No unpublished LR scheduler
@@ -4743,6 +5040,13 @@ if __name__ == "__main__":
             "forward eta target still crosses the train/validation boundary"
         )
 
+    # STANDARD-COMPLETION for Eq. (30): balance the three physical-unit groups
+    # using Data01-train only. No validation or independent-test value enters.
+    state_loss_group_rms = training_state_group_rms_scales(
+        target_states_9,
+        train_index,
+    )
+
     # Fit every normalization statistic on Data01-train only.
     # Validation and Data02 therefore cannot leak into feature scaling.
     fixed_mean = fixed[train_index].mean(axis=0)
@@ -4772,15 +5076,17 @@ if __name__ == "__main__":
         channel_masks, observations_normalized, 0.0
     )
 
-    # Only INPUT features are normalized. Eq. (30) targets remain in physical
-    # units; target scaling would change the relative state weighting and is not
-    # stated in the paper.
     np.savez(
         OUTPUT_DIR / "normalizer.npz",
         fixed_mean=fixed_mean,
         fixed_std=fixed_std,
         obs_mean=obs_mean,
         obs_std=obs_std,
+        state_loss_group_rms=state_loss_group_rms,
+        state_loss_group_units=np.asarray(["m", "m/s", "rad"]),
+        state_loss_scaling_status=np.asarray(
+            "STANDARD_COMPLETION_train_only_group_RMS_Eq30_units_unpublished"
+        ),
         validation_fraction=VALIDATION_FRACTION,
         split_index=split,
         dropped_boundary_index=boundary_index,
@@ -4911,6 +5217,11 @@ if __name__ == "__main__":
         lr=REPRESENTATION_BLOCK_LEARNING_RATE,
     )
     training_history = []
+    state_loss_group_rms_t = torch.tensor(
+        state_loss_group_rms,
+        dtype=torch.float64,
+        device=DEVICE,
+    )
 
     def _state_prediction_loss(predicted_update, true_error_state_9):
         if predicted_update.ndim != 2:
@@ -4923,13 +5234,23 @@ if __name__ == "__main__":
         elif predicted_update.shape[1] != INS_STATE_DIM:
             raise ValueError("predicted_update must have 9 or 15 state columns")
 
-        linear_error_6, attitude_angle = fig8_post_update_error_state_9(
+        linear_error_6, attitude_rotation_vector = fig8_post_update_error_state_9(
             predicted_update,
             true_error_state_9,
         )
         per_sample_squared_norm = (
-            torch.sum(linear_error_6**2, dim=1)
-            + attitude_angle**2
+            torch.sum(
+                (linear_error_6[:, :3] / state_loss_group_rms_t[0]) ** 2,
+                dim=1,
+            )
+            + torch.sum(
+                (linear_error_6[:, 3:6] / state_loss_group_rms_t[1]) ** 2,
+                dim=1,
+            )
+            + (
+                torch.linalg.vector_norm(attitude_rotation_vector, dim=1)
+                / state_loss_group_rms_t[2]
+            ) ** 2
         )
         state_loss = torch.mean(per_sample_squared_norm)
         position_rmse = torch.sqrt(
@@ -4963,8 +5284,8 @@ if __name__ == "__main__":
             eta_forward_target_9,
         )
 
-        # Same raw physical-state squared-error criterion at both supervised
-        # instants. Equal averaging here is simply the time-sample mean analogue
+        # The same train-only dimensionless state criterion is used at both
+        # supervised instants. Equal averaging is the time-sample mean analogue
         # of Yan Eq. (32), not a tunable KG-vs-eta branch weight.
         temporal_state_loss = torch.stack(
             [current_eq30_loss, following_eq30_loss]
@@ -5314,7 +5635,7 @@ if __name__ == "__main__":
             f"epoch {epoch:03d}/{TRAINING_EPOCHS}: "
             f"theta_obj={filter_phase['objective']:.6g}, "
             f"psi_obj={representation_phase['objective']:.6g}, "
-            f"val_Eq30mean={validation['temporal_state_loss']:.6g}, "
+            f"val_scaledEq30mean={validation['temporal_state_loss']:.6g}, "
             f"val_current={validation['current_eq30']:.6g}, "
             f"val_following={validation['following_eq30_completion']:.6g}, "
             f"val_posRMSE={validation['current_position_rmse_m']:.3f} m, "
@@ -5346,10 +5667,10 @@ if __name__ == "__main__":
 
         if epochs_without_improvement >= EARLY_STOP_PATIENCE:
             print(
-                "early stopping: validation Eq.(30)-type temporal state loss "
+                "early stopping: validation scaled Eq.(30)-type temporal state loss "
                 f"did not improve for {EARLY_STOP_PATIENCE} complete alternating "
                 f"cycles; best epoch={best_epoch}, "
-                f"best val Eq30mean={best_val_joint_state_loss:.6g}"
+                f"best val scaledEq30mean={best_val_joint_state_loss:.6g}"
             )
             break
 
@@ -5372,8 +5693,12 @@ if __name__ == "__main__":
             "fixed_std": fixed_std,
             "obs_mean": obs_mean,
             "obs_std": obs_std,
+            "state_loss_group_rms": state_loss_group_rms,
+            "state_loss_group_units": ["m", "m/s", "rad"],
+            "state_loss_scaling_status": "STANDARD_COMPLETION_train_only_group_RMS_Eq30_units_unpublished",
+            "gain_head_initialization": "exact_zero_STANDARD_COMPLETION_Yan_initialization_unpublished",
             "supervised_state_dim": SUPERVISED_STATE_DIM,
-            "loss": "mean_raw_state_Eq30_over_current_and_following_supervised_instants_plus_Eq32_L2",
+            "loss": "mean_train_only_group_RMS_scaled_state_Eq30_over_current_and_following_supervised_instants_plus_Eq32_L2",
             "training_features": "offline_fixed_labeled_dataset_Yan_Eqs18_to_20",
             "optimization": "Ref15_Algorithm2_style_theta_then_psi_same_state_objective",
             "alternating_theta_block": "Masked_FC_gain_head_plus_eta_head",
@@ -5866,6 +6191,9 @@ if __name__ == "__main__":
         current_eta_diag = np.zeros(IMU_ERROR_DIM)
         previous_online = None
         position_errors = []
+        classical_position_errors = []
+        normalized_feature_max_by_epoch = []
+        diagnostic_trace = []
         diagnostic_steps = 0
         max_abs_innovation = 0.0
         max_abs_normalized_feature = 0.0
@@ -5873,6 +6201,118 @@ if __name__ == "__main__":
         max_eta_gyro_abs = 0.0
         max_eta_accel_abs = 0.0
         fde_stats = _new_fde_stats()
+        classical_row_by_fusion_index = {
+            int(row["fusion_index"]): row for row in history_rows
+        }
+        offline_data01_max_abs_normalized_feature = max(
+            float(np.max(np.abs(fixed_normalized))),
+            float(np.max(np.abs(observations_normalized))),
+        )
+
+        def _record_diagnostic_epoch(
+            *,
+            fusion_index: int,
+            time_gpst_s: float,
+            fusion_mode: str,
+            position_error_ecef_m: Array,
+            fde_result: Ref33FDEResult,
+            measurements_used: int,
+            max_abs_innovation_this_epoch_m: float,
+            max_abs_normalized_feature_this_epoch: float,
+            normalized_feature_groups: dict[str, float],
+            correction: Array,
+            active_gain: Array | None,
+            eta: Array,
+        ) -> None:
+            classical_row = classical_row_by_fusion_index.get(
+                int(fusion_index)
+            )
+            if classical_row is None:
+                raise RuntimeError(
+                    "recursive diagnostic has no same-epoch classical reference "
+                    f"for fusion_index={fusion_index}"
+                )
+            classical_error = (
+                np.asarray(classical_row["posterior_position"], dtype=float)
+                - np.asarray(classical_row["truth_position"], dtype=float)
+            )
+            learned_error = np.asarray(
+                position_error_ecef_m, dtype=float
+            ).reshape(3)
+            correction = np.asarray(
+                correction, dtype=float
+            ).reshape(INS_STATE_DIM)
+            eta = np.asarray(eta, dtype=float).reshape(IMU_ERROR_DIM)
+            gain_max_abs = (
+                0.0
+                if active_gain is None or np.size(active_gain) == 0
+                else float(np.max(np.abs(active_gain)))
+            )
+            expected_feature_groups = {
+                "normalized_delta_accel_max_abs",
+                "normalized_delta_gyro_max_abs",
+                "normalized_state_residual_max_abs",
+                "normalized_state_innovation_max_abs",
+                "normalized_observation_residual_max_abs",
+                "normalized_observation_innovation_max_abs",
+            }
+            if set(normalized_feature_groups) != expected_feature_groups:
+                raise ValueError("incomplete normalized feature-group diagnostics")
+
+            position_errors.append(learned_error.copy())
+            classical_position_errors.append(classical_error.copy())
+            normalized_feature_max_by_epoch.append(
+                float(max_abs_normalized_feature_this_epoch)
+            )
+            diagnostic_trace.append({
+                "trace_index": int(len(diagnostic_trace)),
+                "fusion_index": int(fusion_index),
+                "time_gpst_s": float(time_gpst_s),
+                "fusion_mode": str(fusion_mode),
+                "n_input_before_fde": int(len(fde_result.tested_measurements)),
+                "n_used_after_fde": int(measurements_used),
+                "fde_detected": bool(fde_result.detected),
+                "fde_unresolved": bool(fde_result.unresolved),
+                "fde_excluded_sat_ids": ";".join(fde_result.excluded_sat_ids),
+                "learned_error_x_ecef_m": float(learned_error[0]),
+                "learned_error_y_ecef_m": float(learned_error[1]),
+                "learned_error_z_ecef_m": float(learned_error[2]),
+                "learned_position_error_norm_m": float(
+                    np.linalg.norm(learned_error)
+                ),
+                "classical_error_x_ecef_m": float(classical_error[0]),
+                "classical_error_y_ecef_m": float(classical_error[1]),
+                "classical_error_z_ecef_m": float(classical_error[2]),
+                "classical_position_error_norm_m": float(
+                    np.linalg.norm(classical_error)
+                ),
+                "max_abs_innovation_this_epoch_m": float(
+                    max_abs_innovation_this_epoch_m
+                ),
+                "max_abs_normalized_feature_this_epoch": float(
+                    max_abs_normalized_feature_this_epoch
+                ),
+                **{
+                    key: float(value)
+                    for key, value in normalized_feature_groups.items()
+                },
+                "max_abs_learned_gain": gain_max_abs,
+                "correction_position_norm_m": float(
+                    np.linalg.norm(correction[0:3])
+                ),
+                "correction_velocity_norm_mps": float(
+                    np.linalg.norm(correction[3:6])
+                ),
+                "correction_attitude_norm_rad": float(
+                    np.linalg.norm(correction[6:9])
+                ),
+                "eta_gyro_max_abs_radps": float(
+                    np.max(np.abs(eta[ETA_GYRO_SLICE]))
+                ),
+                "eta_accel_max_abs_mps2": float(
+                    np.max(np.abs(eta[ETA_ACCEL_SLICE]))
+                ),
+            })
 
         current_gyro, current_accel = compensate_imu(
             imr.angular_rate_body_radps[0],
@@ -5963,7 +6403,41 @@ if __name__ == "__main__":
                             "recursive Data01 diagnostic INS-only position became "
                             f"non-finite at fusion_index={fusion_index}"
                         )
-                    position_errors.append(error)
+                    tested_innovation = (
+                        fde_result.tested_measurement_model.innovation
+                    )
+                    max_abs_innovation_this_epoch = (
+                        0.0
+                        if tested_innovation.size == 0
+                        else float(np.max(np.abs(tested_innovation)))
+                    )
+                    max_abs_innovation = max(
+                        max_abs_innovation,
+                        max_abs_innovation_this_epoch,
+                    )
+                    _record_diagnostic_epoch(
+                        fusion_index=fusion_index,
+                        time_gpst_s=t,
+                        fusion_mode="INS_only_after_unresolved_or_empty_FDE",
+                        position_error_ecef_m=error,
+                        fde_result=fde_result,
+                        measurements_used=0,
+                        max_abs_innovation_this_epoch_m=(
+                            max_abs_innovation_this_epoch
+                        ),
+                        max_abs_normalized_feature_this_epoch=0.0,
+                        normalized_feature_groups={
+                            "normalized_delta_accel_max_abs": 0.0,
+                            "normalized_delta_gyro_max_abs": 0.0,
+                            "normalized_state_residual_max_abs": 0.0,
+                            "normalized_state_innovation_max_abs": 0.0,
+                            "normalized_observation_residual_max_abs": 0.0,
+                            "normalized_observation_innovation_max_abs": 0.0,
+                        },
+                        correction=np.zeros(INS_STATE_DIM),
+                        active_gain=None,
+                        eta=current_eta_diag,
+                    )
                     diagnostic_steps += 1
                     previous_online = _make_online_context(
                         (),
@@ -6012,14 +6486,24 @@ if __name__ == "__main__":
                 feature_gyro,
             )
             fixed_k, obs_k, current_mask, channel_k, innovation_k, _, _ = arrays
+            feature_group_maxima = normalized_feature_group_maxima(
+                fixed_k,
+                obs_k,
+            )
+            max_abs_innovation_this_epoch = float(
+                np.max(np.abs(innovation_k))
+            )
+            max_abs_normalized_feature_this_epoch = max(
+                float(np.max(np.abs(fixed_k))),
+                float(np.max(np.abs(obs_k))),
+            )
             max_abs_innovation = max(
                 max_abs_innovation,
-                float(np.max(np.abs(innovation_k))),
+                max_abs_innovation_this_epoch,
             )
             max_abs_normalized_feature = max(
                 max_abs_normalized_feature,
-                float(np.max(np.abs(fixed_k))),
-                float(np.max(np.abs(obs_k))),
+                max_abs_normalized_feature_this_epoch,
             )
             with torch.inference_mode():
                 output = model(
@@ -6103,7 +6587,24 @@ if __name__ == "__main__":
                     "recursive Data01 diagnostic position became non-finite at "
                     f"fusion_index={fusion_index}"
                 )
-            position_errors.append(error)
+            _record_diagnostic_epoch(
+                fusion_index=fusion_index,
+                time_gpst_s=t,
+                fusion_mode="MaskedCLA_post_hard_FDE",
+                position_error_ecef_m=error,
+                fde_result=fde_result,
+                measurements_used=len(measurements),
+                max_abs_innovation_this_epoch_m=(
+                    max_abs_innovation_this_epoch
+                ),
+                max_abs_normalized_feature_this_epoch=(
+                    max_abs_normalized_feature_this_epoch
+                ),
+                normalized_feature_groups=feature_group_maxima,
+                correction=correction,
+                active_gain=active_gain,
+                eta=eta,
+            )
             diagnostic_steps += 1
 
         if diagnostic_steps == 0:
@@ -6112,6 +6613,34 @@ if __name__ == "__main__":
             )
 
         errors = np.stack(position_errors)
+        classical_errors = np.stack(classical_position_errors)
+        stability_assessment = assess_recursive_stability(
+            errors,
+            classical_errors,
+            np.asarray(normalized_feature_max_by_epoch, dtype=float),
+            offline_data01_max_abs_normalized_feature,
+        )
+        for row in diagnostic_trace:
+            row["worse_than_same_epoch_classical"] = bool(
+                row["learned_position_error_norm_m"]
+                > row["classical_position_error_norm_m"]
+            )
+            row["outside_classical_position_envelope"] = bool(
+                row["learned_position_error_norm_m"]
+                > stability_assessment[
+                    "classical_same_epoch_max_position_error_m"
+                ]
+            )
+            row["outside_offline_feature_support"] = bool(
+                row["max_abs_normalized_feature_this_epoch"]
+                > offline_data01_max_abs_normalized_feature
+            )
+        first_index = stability_assessment["first_reference_violation_index"]
+        stability_assessment["first_reference_violation"] = (
+            None
+            if first_index is None
+            else dict(diagnostic_trace[first_index])
+        )
         rmse_xyz = np.sqrt(np.mean(errors**2, axis=0))
         rmse_3d = float(
             np.sqrt(np.mean(np.sum(errors**2, axis=1)))
@@ -6126,9 +6655,10 @@ if __name__ == "__main__":
             "max_abs_eta_gyro_radps": max_eta_gyro_abs,
             "max_abs_eta_accel_mps2": max_eta_accel_abs,
             "fde": fde_stats,
+            "stability_assessment": stability_assessment,
             "changes_weights": False,
             "purpose": "pre_Data02_recursive_stability_diagnostic",
-        }
+        }, diagnostic_trace
 
     selected_training_stage = (
         "optional_closed_loop_stability_completion"
@@ -6137,10 +6667,14 @@ if __name__ == "__main__":
     )
 
     recursive_data01_diagnostic = None
+    recursive_data01_trace = []
     if REQUIRE_RECURSIVE_DATA01_DIAGNOSTIC:
         print("\n=== RECURSIVE DATA01 STABILITY DIAGNOSTIC ===")
         try:
-            recursive_data01_diagnostic = (
+            (
+                recursive_data01_diagnostic,
+                recursive_data01_trace,
+            ) = (
                 _recursive_data01_diagnostic_rollout()
             )
         except Exception as diagnostic_error:
@@ -6156,6 +6690,24 @@ if __name__ == "__main__":
         recursive_data01_diagnostic["selected_training_stage"] = (
             selected_training_stage
         )
+        (OUTPUT_DIR / "recursive_data01_diagnostic.json").write_text(
+            json.dumps(recursive_data01_diagnostic, indent=2),
+            encoding="utf-8",
+        )
+        # Preserve the complete offline training record even when the stability
+        # gate intentionally blocks the later independent-test stage.
+        (OUTPUT_DIR / "history.json").write_text(
+            json.dumps(training_history, indent=2), encoding="utf-8"
+        )
+        with (
+            OUTPUT_DIR / "recursive_data01_trace.csv"
+        ).open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(
+                stream,
+                fieldnames=list(recursive_data01_trace[0]),
+            )
+            writer.writeheader()
+            writer.writerows(recursive_data01_trace)
         print(
             "recursive Data01 diagnostic: "
             f"steps={recursive_data01_diagnostic['steps']}, "
@@ -6183,6 +6735,40 @@ if __name__ == "__main__":
             f"max(stat/Td)="
             f"{recursive_data01_diagnostic['fde']['max_statistic_to_threshold_ratio']:.3g}"
         )
+        stability = recursive_data01_diagnostic["stability_assessment"]
+        print(
+            "recursive Data01 acceptance learned/classical RMSE / "
+            "learned/classical max / accepted: "
+            f"{stability['learned_rmse_3d_m']:.3f}/"
+            f"{stability['classical_same_epoch_rmse_3d_m']:.3f} m / "
+            f"{stability['learned_max_position_error_m']:.3f}/"
+            f"{stability['classical_same_epoch_max_position_error_m']:.3f} m / "
+            f"{stability['accepted_for_independent_test']}"
+        )
+        if not stability["accepted_for_independent_test"]:
+            first = stability["first_reference_violation"]
+            first_text = (
+                "none"
+                if first is None
+                else (
+                    f"fusion_index={first['fusion_index']}, "
+                    f"time={first['time_gpst_s']}, "
+                    f"mode={first['fusion_mode']}, "
+                    f"position_error={first['learned_position_error_norm_m']:.3f} m, "
+                    f"max_abs_normalized_feature="
+                    f"{first['max_abs_normalized_feature_this_epoch']:.6g}"
+                )
+            )
+            raise RuntimeError(
+                "The selected checkpoint failed the Data01 recursive stability "
+                "acceptance gate and is not eligible for independent Data02 "
+                "testing. This STANDARD-COMPLETION uses only the same-epoch "
+                "classical Data01 trajectory; Data02 does not influence the "
+                "decision. reasons="
+                f"{stability['reason_codes']}; first_reference_violation="
+                f"{first_text}. Diagnostic artifacts were saved to "
+                f"{OUTPUT_DIR.resolve()}."
+            )
 
     best_state = {
         key: value.detach().cpu().clone()
@@ -6200,6 +6786,10 @@ if __name__ == "__main__":
             "fixed_std": fixed_std,
             "obs_mean": obs_mean,
             "obs_std": obs_std,
+            "state_loss_group_rms": state_loss_group_rms,
+            "state_loss_group_units": ["m", "m/s", "rad"],
+            "state_loss_scaling_status": "STANDARD_COMPLETION_train_only_group_RMS_Eq30_units_unpublished",
+            "gain_head_initialization": "exact_zero_STANDARD_COMPLETION_Yan_initialization_unpublished",
             "supervised_state_dim": SUPERVISED_STATE_DIM,
             "bias_gain_rows_forced_zero": True,
             "classical_bias_gain_rows_forced_zero": True,
@@ -6214,7 +6804,7 @@ if __name__ == "__main__":
             "eta_fd_gyro_step_radps": ETA_FD_GYRO_STEP_RADPS,
             "eta_fd_accel_step_mps2": ETA_FD_ACCEL_STEP_MPS2,
             "training_mode": selected_training_stage,
-            "paper_baseline_loss": "mean_raw_state_Eq30_over_current_and_following_supervised_instants_plus_Eq32_L2",
+            "paper_baseline_loss": "mean_train_only_group_RMS_scaled_state_Eq30_over_current_and_following_supervised_instants_plus_Eq32_L2",
             "optimization": "Ref15_Algorithm2_style_theta_then_psi_same_state_objective",
             "alternating_theta_block": "Masked_FC_gain_head_plus_eta_head",
             "alternating_psi_block": "Masked_CNN_plus_Masked_LSTM_plus_Masked_Attention",
@@ -6243,6 +6833,13 @@ if __name__ == "__main__":
             "closed_loop_finetune_lr_completion": CLOSED_LOOP_FINETUNE_LR,
             "closed_loop_reset_interval_completion": CLOSED_LOOP_RESET_INTERVAL,
             "recursive_data01_diagnostic": recursive_data01_diagnostic,
+            "pre_Data02_acceptance_gate": (
+                recursive_data01_diagnostic["stability_assessment"]
+            ),
+            "acceptance_gate_status": (
+                "STANDARD_COMPLETION_same_epoch_Data01_classical_reference_"
+                "Yan_threshold_unpublished"
+            ),
         },
         OUTPUT_DIR / "best_model.pt",
     )
@@ -6611,6 +7208,17 @@ if __name__ == "__main__":
                     "fde_estimated_fault_m": float(fde_result.estimated_fault_m),
                     "fde_hard_exclusion_applied": bool(fde_result.excluded_sat_ids),
                     "fde_state_correction_norm": 0.0,
+                    "max_abs_normalized_feature": 0.0,
+                    "normalized_delta_accel_max_abs": 0.0,
+                    "normalized_delta_gyro_max_abs": 0.0,
+                    "normalized_state_residual_max_abs": 0.0,
+                    "normalized_state_innovation_max_abs": 0.0,
+                    "normalized_observation_residual_max_abs": 0.0,
+                    "normalized_observation_innovation_max_abs": 0.0,
+                    "max_abs_learned_gain": 0.0,
+                    "correction_position_norm_m": 0.0,
+                    "correction_velocity_norm_mps": 0.0,
+                    "correction_attitude_norm_rad": 0.0,
                     "fde_unresolved": bool(fde_result.unresolved),
                     "fusion_mode": "INS_only_after_unresolved_or_empty_FDE",
                 })
@@ -6681,6 +7289,10 @@ if __name__ == "__main__":
             innovation_now,
             last_feature_accel,
             last_feature_gyro,
+        )
+        feature_group_maxima = normalized_feature_group_maxima(
+            fixed_k,
+            obs_k,
         )
 
         with torch.inference_mode():
@@ -6813,7 +7425,24 @@ if __name__ == "__main__":
             ),
             "fde_estimated_fault_m": float(fde_result.estimated_fault_m),
             "fde_hard_exclusion_applied": bool(fde_result.excluded_sat_ids),
-            "fde_state_correction_norm": 0.0,
+            # Retained for output compatibility; this combines unlike physical
+            # units and must not be used as a scientific acceptance metric.
+            "fde_state_correction_norm": float(np.linalg.norm(correction)),
+            "max_abs_normalized_feature": max(
+                float(np.max(np.abs(fixed_k))),
+                float(np.max(np.abs(obs_k))),
+            ),
+            **feature_group_maxima,
+            "max_abs_learned_gain": float(np.max(np.abs(active_gain))),
+            "correction_position_norm_m": float(
+                np.linalg.norm(correction[0:3])
+            ),
+            "correction_velocity_norm_mps": float(
+                np.linalg.norm(correction[3:6])
+            ),
+            "correction_attitude_norm_rad": float(
+                np.linalg.norm(correction[6:9])
+            ),
             "fde_unresolved": bool(fde_result.unresolved),
             "fusion_mode": "MaskedCLA_post_hard_FDE",
         })
@@ -6884,6 +7513,17 @@ if __name__ == "__main__":
             "fde_estimated_fault_m",
             "fde_hard_exclusion_applied",
             "fde_state_correction_norm",
+            "max_abs_normalized_feature",
+            "normalized_delta_accel_max_abs",
+            "normalized_delta_gyro_max_abs",
+            "normalized_state_residual_max_abs",
+            "normalized_state_innovation_max_abs",
+            "normalized_observation_residual_max_abs",
+            "normalized_observation_innovation_max_abs",
+            "max_abs_learned_gain",
+            "correction_position_norm_m",
+            "correction_velocity_norm_mps",
+            "correction_attitude_norm_rad",
             "fde_unresolved",
             "fusion_mode",
             "x_ecef_m",
@@ -6913,6 +7553,17 @@ if __name__ == "__main__":
                 row["fde_estimated_fault_m"],
                 int(row["fde_hard_exclusion_applied"]),
                 row["fde_state_correction_norm"],
+                row["max_abs_normalized_feature"],
+                row["normalized_delta_accel_max_abs"],
+                row["normalized_delta_gyro_max_abs"],
+                row["normalized_state_residual_max_abs"],
+                row["normalized_state_innovation_max_abs"],
+                row["normalized_observation_residual_max_abs"],
+                row["normalized_observation_innovation_max_abs"],
+                row["max_abs_learned_gain"],
+                row["correction_position_norm_m"],
+                row["correction_velocity_norm_mps"],
+                row["correction_attitude_norm_rad"],
                 int(row["fde_unresolved"]),
                 row["fusion_mode"],
                 *row["position"].tolist(),
@@ -6998,7 +7649,14 @@ if __name__ == "__main__":
             "training_features": "offline_fixed_labeled_dataset_Yan_Eqs18_to_20",
             "recursive_training_claimed_by_paper": False,
             "bptt_across_navigation_epochs": False,
-            "loss": "mean_raw_state_Eq30_over_current_and_following_supervised_instants_plus_Eq32_L2",
+            "loss": "mean_train_only_group_RMS_scaled_state_Eq30_over_current_and_following_supervised_instants_plus_Eq32_L2",
+            "state_loss_group_rms": {
+                "position_m": float(state_loss_group_rms[0]),
+                "velocity_mps": float(state_loss_group_rms[1]),
+                "attitude_rad": float(state_loss_group_rms[2]),
+            },
+            "state_loss_scaling_status": "STANDARD_COMPLETION_train_only_group_RMS_Eq30_units_unpublished",
+            "gain_head_initialization": "exact_zero_STANDARD_COMPLETION_Yan_initialization_unpublished",
             "alternating_optimization": "Ref15_Algorithm2_order_theta_then_psi_same_objective",
             "alternating_theta_block": "Masked_FC_gain_head_plus_eta_head",
             "alternating_psi_block": "Masked_CNN_plus_Masked_LSTM_plus_Masked_Attention",
@@ -7019,6 +7677,13 @@ if __name__ == "__main__":
             "closed_loop_finetune_lr_if_enabled": CLOSED_LOOP_FINETUNE_LR,
             "closed_loop_reset_interval_if_enabled": CLOSED_LOOP_RESET_INTERVAL,
             "recursive_data01_diagnostic": recursive_data01_diagnostic,
+            "pre_Data02_acceptance_gate": (
+                recursive_data01_diagnostic["stability_assessment"]
+            ),
+            "acceptance_gate_status": (
+                "STANDARD_COMPLETION_same_epoch_Data01_classical_reference_"
+                "Yan_threshold_unpublished"
+            ),
         },
         "test_causal_warm_start": {
             "method": "one_classical_TC_KF_update",
@@ -7101,10 +7766,10 @@ if __name__ == "__main__":
             "Fig. 8 depicts pooling inside the masked CNN block, but the paper publishes no pooling type, kernel, or stride; no pooling operator is guessed in this reproduction.",
             "Fig. 8 outputs eta_k as inertial-navigation measurement-error estimation and Fig. 2 feeds IMU-error correction back to Error compensation. Eq. (8) is the only explicit compensation equation, so this run uses eta_k=[epsilon_g(3),epsilon_a(3)] and applies it to the following IMU interval. The six-dimensional interpretation, zero-order hold timing, and teacher-forced forward eta loss remain paper-guided completions because the paper does not publish eta_k dimension, timing, or a separate eta target/loss.",
             "Fig. 8 is implemented as KG_k -> State Update -> Eq. (30) state loss. Eqs. (18)-(20) define an offline labeled training dataset; the paper does not state that training features are recursively regenerated from previous network outputs or that gradients are propagated through multiple navigation epochs, so recursive/BPTT training is not attributed to the paper.",
-            "The eta branch has no direct pseudo-label. Its following-interval navigation consequence is treated as another supervised state instant in the same raw Eq. (30)-type temporal state objective. The future-state construction is still a paper-guided completion because Yan et al. do not publish eta_k timing/supervision. One chronological boundary sample is dropped so its future target cannot leak validation truth into training.",
+            "The eta branch has no direct pseudo-label. Its following-interval navigation consequence is treated as another supervised state instant in the same train-only group-RMS-scaled Eq. (30)-type temporal state objective. The future-state construction is still a paper-guided completion because Yan et al. do not publish eta_k timing/supervision. One chronological boundary sample is dropped so its future target cannot leak validation truth into training.",
             "Yan et al. explicitly state alternating optimization and cite Ref. [15]. This run follows Ref. [15] Algorithm 2 ordering (filter/output block theta, then representation block psi) with the same final state-estimation objective in both phases. The exact Yan Masked-CLA partition is unpublished, so mapping theta to the two Masked-FC output heads and psi to Masked CNN/LSTM/attention is a declared paper-guided completion.",
             "Because the supplied postprocessed truth contains position/velocity/attitude but not IMU-bias labels, Eq. (30) is reproduced on the available 9 state components and bias gain rows 9:15 are forced to zero rather than trained against invented labels.",
-            "Input features are normalized, but Eq. (30) state targets are not normalized because the paper does not specify target/state-error scaling.",
+            "Input features are normalized from Data01-train. Because Yan et al. do not publish how squared metres, squared metres/second, and squared radians are balanced in Eq. (30), the three state-error groups are divided by their Data01-train RMS norms. This declared standard completion uses no validation or Data02 statistics.",
             "The 500-epoch horizon is guided by Fig. 15; the exact stopping epoch is not published in the text.",
             "The paper defines zero-padding with Nmax from the training dataset but does not specify behavior when an independent test epoch has more observations than that Nmax. This run uses a declared shared per-satellite gain-head completion so every valid test observation is retained without using test labels/statistics for training or normalization.",
             "Exact fusion scheduling now uses the validated orchestration.py event scheduler; its current-sample IMU zero-order-hold convention remains a documented standard completion because the paper does not publish the raw IMU interpolation/hold rule.",
