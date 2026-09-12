@@ -36,6 +36,10 @@ Intentional project differences from Yan et al. (2026) that are still retained:
   observations from one projected GNSS constellation), the FDE result is marked
   unresolved. No suspect observation from that epoch is sent to KalmanNet; the
   navigation solution remains INS-propagated for that fusion epoch.
+- Because neither Yan et al. nor Ref. [33] publishes a multiple-fault exclusion
+  loop for this Masked-KalmanNet setting, the remaining raw innovation is tested
+  once after the declared single-pseudorange exclusion. A still-inconsistent
+  remainder is marked unresolved and cannot reach the learned gain.
 - Because this project eliminates GPS/BDS receiver clocks by a WLS projection,
   Ref. [33]'s full-rank chi-square test is evaluated in the effective projected
   residual subspace (degrees of freedom = rank(Q_nu_nu)). Yan et al. do not
@@ -2415,6 +2419,15 @@ class Ref33FDEResult:
     local_identification_score: float
     estimated_fault_m: float
     Q_nu_nu: Array
+    # STANDARD-COMPLETION: Yan et al. and Ref. [33] do not publish an
+    # iterative/multiple-fault exclusion policy for this exact Masked-KalmanNet
+    # setting.  After the declared one-pseudorange hard exclusion, the remaining
+    # raw innovation is therefore checked once more.  An inconsistent remainder
+    # is kept away from the learned gain and reported as unresolved.
+    post_exclusion_statistic: float = 0.0
+    post_exclusion_threshold: float = float("inf")
+    post_exclusion_dof: int = 0
+    post_exclusion_consistent: bool = True
 
 
 def _ref33_psd_pinv_and_rank(matrix: Array) -> tuple[Array, int]:
@@ -2629,6 +2642,11 @@ def ref33_fde_dia_decision(
     If Identification is structurally ambiguous, the epoch is marked unresolved
     and no suspect measurement is passed to the estimator. The navigation state
     then remains INS-propagated for that fusion epoch.
+
+    After one uniquely identified pseudorange is removed, a single global
+    consistency re-test is applied to the remaining raw innovation. This is a
+    declared STANDARD-COMPLETION because neither source publishes a recursive
+    multiple-fault policy for the present learned-gain architecture.
     """
     current = tuple(retain_clock_observable_measurements(measurements))
     tested_model = build_measurement_model(nav, current, lever_arm_b_m)
@@ -2683,6 +2701,58 @@ def ref33_fde_dia_decision(
     usable = tuple(retain_clock_observable_measurements(remaining))
     filtered_model = build_measurement_model(nav, usable, lever_arm_b_m)
 
+    # Yan et al. require fault elimination before the learned KG is used, but do
+    # not publish a multiple-fault procedure.  Passing a still-inconsistent set to
+    # KalmanNet would falsely treat a single selected hypothesis as proof that all
+    # large faults were removed.  Re-run only the global raw-innovation test after
+    # the single declared exclusion.  Do not recursively invent further fault
+    # hypotheses: if the remainder is empty, rank-zero, or still rejected, keep
+    # this fusion epoch INS-only and mark the decision unresolved.
+    post_statistic = 0.0
+    post_threshold = float("inf")
+    post_dof = 0
+    post_consistent = False
+    if usable:
+        (
+            post_statistic,
+            post_threshold,
+            post_dof,
+            _,
+            _,
+        ) = _ref33_detection_terms(
+            prior_covariance,
+            filtered_model,
+            alpha,
+        )
+        post_consistent = (
+            post_dof > 0
+            and post_statistic <= post_threshold
+        )
+
+    if not post_consistent:
+        return Ref33FDEResult(
+            current,
+            tested_model,
+            (),
+            empty_model,
+            True,
+            (selected.sat_id,),
+            (selected.constellation,),
+            (),
+            (selected.sat_id,),
+            statistic,
+            threshold,
+            dof,
+            True,
+            float(identification["local_score"]),
+            float(identification["estimated_fault_m"]),
+            Q_nu_nu,
+            post_statistic,
+            post_threshold,
+            post_dof,
+            False,
+        )
+
     return Ref33FDEResult(
         current,
         tested_model,
@@ -2700,6 +2770,10 @@ def ref33_fde_dia_decision(
         float(identification["local_score"]),
         float(identification["estimated_fault_m"]),
         Q_nu_nu,
+        post_statistic,
+        post_threshold,
+        post_dof,
+        True,
     )
 
 
@@ -2711,6 +2785,7 @@ def _new_fde_stats() -> dict:
         "hard_exclusion_epochs": 0,
         "excluded_measurements": 0,
         "unresolved_epochs": 0,
+        "post_exclusion_failed_epochs": 0,
         "max_statistic_to_threshold_ratio": 0.0,
         "max_abs_estimated_fault_m": 0.0,
         "max_local_identification_score": 0.0,
@@ -2725,6 +2800,10 @@ def _accumulate_fde_stats(stats: dict, result: Ref33FDEResult) -> None:
     stats["hard_exclusion_epochs"] += int(bool(result.excluded_sat_ids))
     stats["excluded_measurements"] += len(result.excluded_sat_ids)
     stats["unresolved_epochs"] += int(result.unresolved)
+    stats["post_exclusion_failed_epochs"] += int(
+        bool(result.excluded_sat_ids)
+        and not result.post_exclusion_consistent
+    )
 
     if math.isfinite(result.threshold) and result.threshold > 0.0:
         stats["max_statistic_to_threshold_ratio"] = max(
@@ -2887,7 +2966,8 @@ def kalman_measurement_update(P: Array, innovation: Array, H: Array, R: Array):
     dx = K @ innovation
     I_KH = np.eye(INS_STATE_DIM) - K @ H
     P_post = I_KH @ P @ I_KH.T + K @ R @ K.T
-    return dx, 0.5 * (P_post + P_post.T), K
+    P_reset = reset_error_state_covariance(P_post, dx)
+    return dx, P_reset, K
 
 
 def learned_gain_covariance_update(
@@ -2895,6 +2975,7 @@ def learned_gain_covariance_update(
     learned_gain: Array,
     measurement_jacobian: Array,
     measurement_covariance: Array,
+    injected_error_state: Array,
 ) -> Array:
     """Joseph covariance bookkeeping for a KalmanNet-produced gain.
 
@@ -2905,11 +2986,16 @@ def learned_gain_covariance_update(
       and future FDE/integrity work. Yan et al. do not publish an explicit
       learned-gain covariance-update equation, so this is a declared
       STANDARD-COMPLETION rather than a paper-exact step.
+    - After the nonlinear attitude feedback, the covariance is mapped into the
+      reset error-state coordinates used by the next propagation epoch.
     """
     prior_covariance = np.asarray(prior_covariance, dtype=float)
     learned_gain = np.asarray(learned_gain, dtype=float)
     measurement_jacobian = np.asarray(measurement_jacobian, dtype=float)
     measurement_covariance = np.asarray(measurement_covariance, dtype=float)
+    injected_error_state = np.asarray(
+        injected_error_state, dtype=float
+    ).reshape(INS_STATE_DIM)
 
     measurement_count = measurement_jacobian.shape[0]
     if (
@@ -2926,6 +3012,7 @@ def learned_gain_covariance_update(
         or not np.all(np.isfinite(learned_gain))
         or not np.all(np.isfinite(measurement_jacobian))
         or not np.all(np.isfinite(measurement_covariance))
+        or not np.all(np.isfinite(injected_error_state))
     ):
         raise ValueError("non-finite P/K/H/R in learned covariance update")
 
@@ -2934,7 +3021,67 @@ def learned_gain_covariance_update(
         update_matrix @ prior_covariance @ update_matrix.T
         + learned_gain @ measurement_covariance @ learned_gain.T
     )
-    return 0.5 * (posterior_covariance + posterior_covariance.T)
+    return reset_error_state_covariance(
+        posterior_covariance,
+        injected_error_state,
+    )
+
+
+def _so3_left_jacobian(rotation_vector_rad: Array) -> Array:
+    """Exact SO(3) left Jacobian for the attitude error reset.
+
+    If ``phi`` is the injected left-multiplicative rotation, a small pre-reset
+    attitude error perturbation is expressed after feedback through
+    ``J_l(phi)``.  The series branch keeps the zero/small-angle case stable.
+    """
+    phi = np.asarray(rotation_vector_rad, dtype=float).reshape(3)
+    theta_squared = float(phi @ phi)
+    K = _skew(phi)
+    K2 = K @ K
+    if theta_squared < 1e-12:
+        # J_l(phi) = I + (1/2-theta^2/24)K
+        #              + (1/6-theta^2/120)K^2 + O(theta^6)
+        a = 0.5 - theta_squared / 24.0 + theta_squared**2 / 720.0
+        b = 1.0 / 6.0 - theta_squared / 120.0 + theta_squared**2 / 5040.0
+    else:
+        theta = math.sqrt(theta_squared)
+        a = (1.0 - math.cos(theta)) / theta_squared
+        b = (theta - math.sin(theta)) / (theta_squared * theta)
+    return np.eye(3) + a * K + b * K2
+
+
+def reset_error_state_covariance(
+    posterior_covariance: Array,
+    injected_error_state: Array,
+) -> Array:
+    """Map posterior covariance into the post-feedback error coordinates.
+
+    ``inject_error_state`` applies
+
+        C_new = Exp(ATTITUDE_FEEDBACK_SIGN * dtheta) C_old.
+
+    Position, velocity, and bias feedback are additive, so their reset Jacobian
+    is identity.  The attitude block is the exact SO(3) left Jacobian evaluated
+    at the injected rotation.  This is a standard error-state completion needed
+    to keep the covariance used by the next FDE/propagation epoch consistent
+    with the reset nominal state; Yan et al. do not print this bookkeeping step.
+    """
+    P = np.asarray(posterior_covariance, dtype=float)
+    dx = np.asarray(injected_error_state, dtype=float).reshape(INS_STATE_DIM)
+    if P.shape != (INS_STATE_DIM, INS_STATE_DIM):
+        raise ValueError("posterior covariance has wrong shape for error-state reset")
+    if not np.all(np.isfinite(P)) or not np.all(np.isfinite(dx)):
+        raise ValueError("non-finite covariance/error-state in feedback reset")
+
+    reset_jacobian = np.eye(INS_STATE_DIM)
+    reset_jacobian[6:9, 6:9] = _so3_left_jacobian(
+        ATTITUDE_FEEDBACK_SIGN * dx[6:9]
+    )
+    reset_covariance = reset_jacobian @ P @ reset_jacobian.T
+    reset_covariance = 0.5 * (reset_covariance + reset_covariance.T)
+    if not np.all(np.isfinite(reset_covariance)):
+        raise FloatingPointError("non-finite covariance after error-state reset")
+    return reset_covariance
 
 
 def inject_error_state(nav: NavigationState, dx: Array) -> NavigationState:
@@ -3944,16 +4091,16 @@ if __name__ == "__main__":
     OUTPUT_DIR = _default_output_dir()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    MAX_FUSION_EPOCHS = 100
-    MAX_TEST_FUSION_EPOCHS = 100
+    MAX_FUSION_EPOCHS = None
+    MAX_TEST_FUSION_EPOCHS = None
 
     # Table III explicitly gives Adam, initial LR=0.01, Conv=24,
     # LSTM=64 x 5, and dropout=0.2. Fig. 15 displays learning curves extending
     # to roughly 500 training epochs, but the text does not publish an exact
     # stopping epoch. Therefore 500 is used only as a maximum figure-guided
     # training horizon.
-    TRAINING_EPOCHS = 10
-    BATCH_SIZE = 16  # unpublished; explicit reproducibility completion
+    TRAINING_EPOCHS = 500
+    BATCH_SIZE = 32  # unpublished; explicit reproducibility completion
     LEARNING_RATE = 0.01
     # Ref. [15] permits separate learning rates for its two alternating blocks,
     # but Yan et al. publish only one initial learning rate (0.01). To avoid an
@@ -3973,7 +4120,7 @@ if __name__ == "__main__":
     # epochs are strongly correlated; a random split would leak near-duplicate
     # temporal context between train and validation.
     VALIDATION_FRACTION = 0.20
-    EARLY_STOP_PATIENCE = 5
+    EARLY_STOP_PATIENCE = 25
     EARLY_STOP_MIN_DELTA = 0.0
 
     # Keep the paper-supported Adam initial LR fixed. No unpublished LR scheduler
@@ -5610,6 +5757,7 @@ if __name__ == "__main__":
                 active_gain,
                 measurement_model.H,
                 measurement_model.R,
+                correction,
             )
             nav_roll = inject_error_state(nav_roll, correction)
             current_eta_roll = eta.copy()
@@ -5923,6 +6071,7 @@ if __name__ == "__main__":
                 active_gain,
                 measurement_model.H,
                 measurement_model.R,
+                correction,
             )
             correction_norm = float(np.linalg.norm(correction))
             max_correction_norm = max(max_correction_norm, correction_norm)
@@ -6029,6 +6178,8 @@ if __name__ == "__main__":
             f"identified={recursive_data01_diagnostic['fde']['identified_fault_modes']}, "
             f"hard_exclusion={recursive_data01_diagnostic['fde']['hard_exclusion_epochs']}, "
             f"unresolved={recursive_data01_diagnostic['fde']['unresolved_epochs']}, "
+            f"post_exclusion_failed="
+            f"{recursive_data01_diagnostic['fde']['post_exclusion_failed_epochs']}, "
             f"max(stat/Td)="
             f"{recursive_data01_diagnostic['fde']['max_statistic_to_threshold_ratio']:.3g}"
         )
@@ -6442,6 +6593,18 @@ if __name__ == "__main__":
                     "fde_statistic": float(fde_result.statistic),
                     "fde_threshold": float(fde_result.threshold),
                     "fde_dof": int(fde_result.dof),
+                    "fde_post_exclusion_statistic": float(
+                        fde_result.post_exclusion_statistic
+                    ),
+                    "fde_post_exclusion_threshold": float(
+                        fde_result.post_exclusion_threshold
+                    ),
+                    "fde_post_exclusion_dof": int(
+                        fde_result.post_exclusion_dof
+                    ),
+                    "fde_post_exclusion_consistent": bool(
+                        fde_result.post_exclusion_consistent
+                    ),
                     "fde_local_identification_score": float(
                         fde_result.local_identification_score
                     ),
@@ -6590,6 +6753,7 @@ if __name__ == "__main__":
             active_gain,
             measurement_model.H,
             measurement_model.R,
+            correction,
         )
         learned_error_state_post = learned_error_state_pred + correction
         nav = inject_error_state(nav, correction)
@@ -6634,6 +6798,16 @@ if __name__ == "__main__":
             "fde_statistic": float(fde_result.statistic),
             "fde_threshold": float(fde_result.threshold),
             "fde_dof": int(fde_result.dof),
+            "fde_post_exclusion_statistic": float(
+                fde_result.post_exclusion_statistic
+            ),
+            "fde_post_exclusion_threshold": float(
+                fde_result.post_exclusion_threshold
+            ),
+            "fde_post_exclusion_dof": int(fde_result.post_exclusion_dof),
+            "fde_post_exclusion_consistent": bool(
+                fde_result.post_exclusion_consistent
+            ),
             "fde_local_identification_score": float(
                 fde_result.local_identification_score
             ),
@@ -6702,6 +6876,10 @@ if __name__ == "__main__":
             "fde_statistic",
             "fde_threshold",
             "fde_dof",
+            "fde_post_exclusion_statistic",
+            "fde_post_exclusion_threshold",
+            "fde_post_exclusion_dof",
+            "fde_post_exclusion_consistent",
             "fde_local_identification_score",
             "fde_estimated_fault_m",
             "fde_hard_exclusion_applied",
@@ -6727,6 +6905,10 @@ if __name__ == "__main__":
                 row["fde_statistic"],
                 row["fde_threshold"],
                 row["fde_dof"],
+                row["fde_post_exclusion_statistic"],
+                row["fde_post_exclusion_threshold"],
+                row["fde_post_exclusion_dof"],
+                int(row["fde_post_exclusion_consistent"]),
                 row["fde_local_identification_score"],
                 row["fde_estimated_fault_m"],
                 int(row["fde_hard_exclusion_applied"]),
@@ -6763,13 +6945,15 @@ if __name__ == "__main__":
                 "orthogonality_does_not_hold_for_arbitrary_learned_gain"
             ),
             "unresolved_policy": "INS_only_epoch_no_suspect_measurement_sent_to_KalmanNet",
+            "post_exclusion_consistency": "one_global_raw_innovation_retest_after_single_hard_exclusion",
+            "post_exclusion_failure_policy": "INS_only_epoch_marked_unresolved_no_recursive_hypothesis_invention",
             "bias_state_policy": "no_FDE_state_injection_bias_rows_remain_frozen",
             "alpha": FDE_SIGNIFICANCE_ALPHA,
             "alpha_status": "completion_from_Ref33_numerical_examples_Yan_does_not_publish_false_alarm_probability",
             "statistical_core_self_check": FDE_STATISTICAL_SELF_CHECK,
             "projected_clock_dof": "rank_Q_nu_nu_due_to_WLS_receiver_clock_projection",
             "fault_mode_completion": "one_1D_measurement_fault_hypothesis_per_pseudorange_Yan_fault_modes_unpublished",
-            "multiple_fault_policy": "single_selected_hypothesis_per_Ref33_Eq6_Eq8_no_iterative_retest",
+            "multiple_fault_policy": "single_selected_hypothesis_then_one_global_consistency_retest_no_recursive_identification",
             "ambiguity_policy": "structural_or_machine_precision_ties_are_unresolved_not_first_index_selected",
             "training_fixed_dataset_fde": False,
             "recursive_data01_stats": recursive_data01_diagnostic.get("fde", {}),
@@ -6856,12 +7040,12 @@ if __name__ == "__main__":
             ],
         },
         "online_update_protocol": {
-            "state_correction": "nominal_dx_equals_Knet_times_raw_projected_innovation_then_if_fault_dx_equals_nominal_dx_minus_Li_nu_per_Yan_Eq34",
+            "state_correction": "dx_equals_Knet_times_post_hard_exclusion_projected_innovation",
             "fde_before_Knet": bool(ENABLE_FDE),
             "eta_feedback": "eta_k_applied_to_following_IMU_samples_in_Eq8_zero_order_hold",
             "eta_added_to_same_epoch_state_correction": False,
             "R_used_to_compute_Knet": False,
-            "covariance_bookkeeping": "Joseph_update_with_learned_gain_STANDARD_COMPLETION",
+            "covariance_bookkeeping": "Joseph_update_with_learned_gain_then_SO3_error_state_reset_STANDARD_COMPLETION",
             "covariance_bookkeeping_affects_learned_state_correction": False,
             "bias_gain_runtime_guard": "rows_9_to_15_must_be_exact_zero",
             "receiver_clock_handling": "epochwise_WLS_nuisance_projected_from_innovation_H_R",
@@ -6969,7 +7153,7 @@ if __name__ == "__main__":
         FDE_STATISTICAL_SELF_CHECK["two_measurement_ambiguity_detected"],
     )
     print(
-        "FDE test checked/detected/identified/hard-exclusion/unresolved:",
+        "FDE test checked/detected/identified/hard-exclusion/unresolved/post-exclusion-failed:",
         test_fde_stats["epochs_checked"],
         "/",
         test_fde_stats["epochs_detected"],
@@ -6979,6 +7163,8 @@ if __name__ == "__main__":
         test_fde_stats["hard_exclusion_epochs"],
         "/",
         test_fde_stats["unresolved_epochs"],
+        "/",
+        test_fde_stats["post_exclusion_failed_epochs"],
     )
     print(
         "FDE test max statistic/threshold ratio / max estimated fault / max local ID score:",
