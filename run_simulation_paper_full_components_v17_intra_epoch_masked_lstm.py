@@ -4106,7 +4106,7 @@ if __name__ == "__main__":
     # to roughly 500 training epochs, but the text does not publish an exact
     # stopping epoch. Therefore 500 is used only as a maximum figure-guided
     # training horizon.
-    TRAINING_EPOCHS = _env_int("MKNET_TRAINING_EPOCHS", 10)
+    TRAINING_EPOCHS = _env_int("MKNET_TRAINING_EPOCHS", 250)
     # Yan et al. do not publish a mini-batch size. BATCH_SIZE is therefore an
     # explicit implementation completion used only for gradient accumulation.
     # The masked LSTM sequence itself is the padded X_bar[k] inside each epoch.
