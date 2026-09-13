@@ -50,15 +50,15 @@ KalmanNet training procedure:
   is not attributed to the paper.
 
 This CNN/LSTM revision retains the Pooling and Flatten stages drawn explicitly in
-Yan Fig. 8, while removing the v13-only hidden/cell-state carry between fusion
-epochs. The masked LSTM now operates only within each zero-padded epoch sequence:
-h/c are initialized for that sample, updated along padded sequence position t,
-and Eq. (25) retains the preceding within-sequence state when M[k,t]=0. Yan et
-al. do not publish stateful cross-epoch h/c carry, so none is added here. The
-trajectory-level BPTT used in the second training stage differentiates the
-external KalmanNet/navigation recursion, not the internal masked-LSTM h/c across
-fusion epochs. The exact pooling operator remains unpublished; the implemented
-same-length masked max-pool is labelled as a Fig.-8-guided completion.
+Yan Fig. 8.  In the reference-guided recursive stage and online evaluation it
+also follows the original KalmanNet train/test contract: recurrent hidden/cell
+state is initialized once at the start of a navigation trajectory and is then
+carried through consecutive fusion epochs.  Within each epoch the mask
+still gates the zero-padded observation slots exactly as Eq. (25) requires.  The
+state is passed explicitly rather than stored on the module, so every training or
+test trajectory has an auditable reset boundary and no state can leak between
+Data01 and Data02.  The exact pooling operator remains unpublished; the
+implemented same-length masked max-pool is labelled as a Fig.-8-guided completion.
 
 The separate post-training recursive Data01 rollout remains diagnostic only and
 never updates a network parameter or feeds information into Data02.
@@ -3476,10 +3476,11 @@ class LEODownlinkSimulator:
 #   - k indexes a fusion epoch/sample;
 #   - t indexes the zero-padded observation-sequence position within that epoch;
 #   - CNN/Pooling/Flatten are applied to each epoch independently;
-#   - the five-layer LSTM iterates over t within each epoch, and Eq. (25) uses
-#     M[k,t] to retain the preceding within-sequence h/c at padded positions;
-#   - h/c are NOT carried from fusion epoch k to k+1 because Yan et al. do not
-#     publish stateful cross-epoch recurrence.
+#   - k is the LSTM's recurrent time direction (fusion epochs); the Nmax slot
+#     states are processed in parallel with shared weights;
+#   - Eq. (25) uses M[k,t] to update or retain each slot's h/c from epoch k-1;
+#   - following the original KalmanNet sequence contract, state is reset at each
+#     trajectory boundary and is never shared between Data01 and Data02.
 #
 # Explicit project completions that remain because Yan et al. do not publish them:
 #   - one pseudorange-only satellite slot is represented by
@@ -3523,11 +3524,13 @@ class MaskedCLAOutput:
     kalman_gain : [B, 15, Nmax]
     imu_error   : [B, 6] -- eta_k = [epsilon_g(3) rad/s, epsilon_a(3) m/s^2]
     attention   : [B, Nmax]
+    recurrent_state : ([5,B,Nmax,64], [5,B,Nmax,64]) for the next epoch
     """
 
     kalman_gain: torch.Tensor
     imu_error: torch.Tensor
     attention: torch.Tensor
+    recurrent_state: tuple[torch.Tensor, torch.Tensor]
 
 
 class MaskedConv1d(nn.Module):
@@ -3636,12 +3639,15 @@ class MaskedConv1d(nn.Module):
 
 
 class MaskedStackedLSTM(nn.Module):
-    """Yan Eqs. (24)-(25): five masked LSTM layers within each epoch sequence.
+    """Yan Eqs. (24)-(25) with the KalmanNet trajectory-state contract.
 
-    Each batch element is one fusion epoch X_bar[k]. Hidden/cell states start
-    from zero for that sample, then recur over padded sequence position t.
-    M[k,t]=0 keeps the preceding within-sequence h/c exactly as Eq. (25)
-    describes. No h/c is carried into fusion epoch k+1.
+    Each call is one fusion epoch k.  Its N padded observation slots are processed
+    in parallel with shared LSTM weights, while each slot t keeps its own h/c
+    along the trajectory.  The optional ``recurrent_state`` therefore contains
+    h/c from epoch k-1 with shape [layer,B,N,H]; omitting it starts a new
+    trajectory from zero.  At M[k,t]=0, that slot's h/c is retained exactly as
+    Eq. (25) specifies.  This keeps the recurrent direction temporal (over k),
+    rather than incorrectly treating satellite order as time.
     """
 
     def __init__(
@@ -3675,7 +3681,8 @@ class MaskedStackedLSTM(nn.Module):
         self,
         x: torch.Tensor,
         mask: torch.Tensor,
-    ) -> torch.Tensor:
+        recurrent_state: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         if x.ndim != 3 or mask.ndim != 2:
             raise ValueError(
                 "MaskedStackedLSTM expects x=[B,N,C] and mask=[B,N]"
@@ -3685,44 +3692,81 @@ class MaskedStackedLSTM(nn.Module):
                 "MaskedStackedLSTM x/mask sequence shapes do not match"
             )
 
-        batch_size, sequence_length = x.shape[:2]
-        h = [
-            x.new_zeros(batch_size, self.hidden_size)
-            for _ in range(self.num_layers)
-        ]
-        c = [
-            x.new_zeros(batch_size, self.hidden_size)
-            for _ in range(self.num_layers)
-        ]
-        outputs: list[torch.Tensor] = []
+        batch_size, slot_count = x.shape[:2]
+        if slot_count <= 0:
+            raise ValueError("MaskedStackedLSTM requires a non-empty sequence")
 
-        for t in range(sequence_length):
-            mt = mask[:, t].to(dtype=x.dtype).unsqueeze(-1)
-            keep = 1.0 - mt
-            layer_input = x[:, t, :]
-
-            for layer, cell in enumerate(self.cells):
-                h_candidate, c_candidate = cell(
-                    layer_input,
-                    (h[layer], c[layer]),
+        expected_state_shape = (
+            self.num_layers,
+            batch_size,
+            slot_count,
+            self.hidden_size,
+        )
+        if recurrent_state is None:
+            h_state = x.new_zeros(expected_state_shape)
+            c_state = x.new_zeros(expected_state_shape)
+        else:
+            if not isinstance(recurrent_state, tuple) or len(recurrent_state) != 2:
+                raise ValueError("recurrent_state must be an (h, c) tensor tuple")
+            h_state, c_state = recurrent_state
+            if (
+                tuple(h_state.shape) != expected_state_shape
+                or tuple(c_state.shape) != expected_state_shape
+            ):
+                raise ValueError(
+                    "recurrent h/c must both have shape "
+                    f"{expected_state_shape}"
                 )
-                h[layer] = mt * h_candidate + keep * h[layer]
-                c[layer] = mt * c_candidate + keep * c[layer]
+            if (
+                h_state.device != x.device
+                or c_state.device != x.device
+                or h_state.dtype != x.dtype
+                or c_state.dtype != x.dtype
+            ):
+                raise ValueError(
+                    "recurrent h/c must share the input device and dtype"
+                )
 
-                layer_input = h[layer]
-                if (
-                    layer < self.num_layers - 1
-                    and self.dropout > 0.0
-                ):
-                    layer_input = F.dropout(
-                        layer_input,
-                        p=self.dropout,
-                        training=self.training,
-                    )
+        mask_value = mask.to(dtype=x.dtype).unsqueeze(-1)
+        keep = 1.0 - mask_value
+        layer_input = x
+        next_h: list[torch.Tensor] = []
+        next_c: list[torch.Tensor] = []
 
-            outputs.append(h[-1])
+        for layer, cell in enumerate(self.cells):
+            h_previous = h_state[layer]
+            c_previous = c_state[layer]
+            h_candidate, c_candidate = cell(
+                layer_input.reshape(batch_size * slot_count, -1),
+                (
+                    h_previous.reshape(batch_size * slot_count, self.hidden_size),
+                    c_previous.reshape(batch_size * slot_count, self.hidden_size),
+                ),
+            )
+            h_candidate = h_candidate.reshape(
+                batch_size, slot_count, self.hidden_size
+            )
+            c_candidate = c_candidate.reshape(
+                batch_size, slot_count, self.hidden_size
+            )
+            h_layer = mask_value * h_candidate + keep * h_previous
+            c_layer = mask_value * c_candidate + keep * c_previous
+            next_h.append(h_layer)
+            next_c.append(c_layer)
 
-        return torch.stack(outputs, dim=1)
+            layer_input = h_layer
+            if layer < self.num_layers - 1 and self.dropout > 0.0:
+                layer_input = F.dropout(
+                    layer_input,
+                    p=self.dropout,
+                    training=self.training,
+                )
+
+        next_state = (
+            torch.stack(next_h, dim=0),
+            torch.stack(next_c, dim=0),
+        )
+        return next_h[-1], next_state
 
 
 class MaskedAttention(nn.Module):
@@ -3793,10 +3837,11 @@ class MaskedCLA(nn.Module):
             -> Masked Attention
             -> FC heads -> KG_k and eta_k.
 
-    Each X_bar[k] is treated as one padded observation sequence. The LSTM
-    recurrence is over sequence position t inside that epoch; its h/c are
-    reinitialized for every epoch/sample. This preserves Yan Eqs. (21)-(25)
-    without adding the cross-fusion hidden-state carry used experimentally in v13.
+    Each X_bar[k] is one padded observation vector.  The masked CNN processes its
+    slots, and the shared LSTM advances each slot state from epoch k-1 to k under
+    M[k,t].  Reset occurs once at a trajectory boundary, matching the original
+    KalmanNet train/test sequence handling without introducing mutable state
+    shared between datasets.
 
     Yan's fixed offline labeled X/M/Y dataset of Eqs. (18)-(20) remains the
     published warm-start training set. A later KalmanNet-reference-guided stage
@@ -3865,6 +3910,7 @@ class MaskedCLA(nn.Module):
         observations: torch.Tensor,
         mask: torch.Tensor,
         channel_mask: torch.Tensor,
+        recurrent_state: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> MaskedCLAOutput:
         if (
             fixed.ndim != 2
@@ -3935,8 +3981,13 @@ class MaskedCLA(nn.Module):
         # Fig. 8: Masked CNN -> Pooling -> Flatten.
         conv_flat = self.conv(token, mask_values)
 
-        # Yan Eqs. (24)-(25): recurrence over padded sequence position t only.
-        lstm = self.lstm(conv_flat, mask_values)
+        # Yan Eqs. (24)-(25): temporal recurrence k-1 -> k, gated per padded
+        # observation slot t by M[k,t].
+        lstm, next_recurrent_state = self.lstm(
+            conv_flat,
+            mask_values,
+            recurrent_state,
+        )
         context, attention = self.attention(
             lstm,
             mask_values,
@@ -3969,6 +4020,7 @@ class MaskedCLA(nn.Module):
             kalman_gain=gain,
             imu_error=imu_error,
             attention=attention,
+            recurrent_state=next_recurrent_state,
         )
 
 
@@ -4081,15 +4133,15 @@ if __name__ == "__main__":
     OUTPUT_DIR = _default_output_dir()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    MAX_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_FUSION_EPOCHS", 50)
-    MAX_TEST_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_TEST_FUSION_EPOCHS", 50)
+    MAX_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_FUSION_EPOCHS", None)
+    MAX_TEST_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_TEST_FUSION_EPOCHS", None)
 
     # Table III explicitly gives Adam, initial LR=0.01, Conv=24,
     # LSTM=64 x 5, and dropout=0.2. Fig. 15 displays learning curves extending
     # to roughly 500 training epochs, but the text does not publish an exact
     # stopping epoch. Therefore 500 is used only as a maximum figure-guided
     # training horizon.
-    TRAINING_EPOCHS = _env_int("MKNET_TRAINING_EPOCHS", 10)
+    TRAINING_EPOCHS = _env_int("MKNET_TRAINING_EPOCHS", 500)
     BATCH_SIZE = _env_int("MKNET_BATCH_SIZE", 16)  # paper does not publish batch size
     LEARNING_RATE = 0.01
     # Ref. [15] permits separate learning rates for its two alternating blocks,
@@ -4887,11 +4939,11 @@ if __name__ == "__main__":
     )
     print(
         "Masked LSTM:",
-        "64 units x 5 layers, dropout=0.2; recurrence within each padded epoch sequence",
+        "64 units x 5 layers, dropout=0.2; masked slot recurrence plus trajectory h/c",
     )
     print(
         "LSTM cross-fusion state carry:",
-        "OFF (no paper-published stateful h/c carry between fusion epochs)",
+        "ON for chronological BPTT/diagnostic/test; reset at every trajectory boundary",
     )
 
     representation_modules = (
@@ -5452,6 +5504,76 @@ if __name__ == "__main__":
             obs_k_raw,
         )
 
+    def _pad_neural_epoch(
+        fixed_k,
+        obs_k,
+        current_mask,
+        channel_k,
+        innovation_k,
+        slot_capacity: int,
+    ):
+        """Pad one online epoch without changing its physical observations."""
+        fixed_k = np.asarray(fixed_k, dtype=float).reshape(FIXED_FEATURE_DIM)
+        obs_k = np.asarray(obs_k, dtype=float).reshape(
+            -1, OBSERVATION_FEATURE_DIM
+        )
+        current_mask = np.asarray(current_mask, dtype=bool).reshape(-1)
+        channel_k = np.asarray(channel_k, dtype=bool).reshape(
+            -1, OBSERVATION_FEATURE_DIM
+        )
+        innovation_k = np.asarray(innovation_k, dtype=float).reshape(-1)
+        count = len(current_mask)
+        if (
+            slot_capacity < count
+            or len(obs_k) != count
+            or len(channel_k) != count
+            or len(innovation_k) != count
+        ):
+            raise ValueError("invalid online neural padding dimensions")
+
+        obs_padded = np.zeros(
+            (slot_capacity, OBSERVATION_FEATURE_DIM), dtype=float
+        )
+        mask_padded = np.zeros(slot_capacity, dtype=bool)
+        channel_padded = np.zeros(
+            (slot_capacity, OBSERVATION_FEATURE_DIM), dtype=bool
+        )
+        innovation_padded_now = np.zeros(slot_capacity, dtype=float)
+        obs_padded[:count] = obs_k
+        mask_padded[:count] = current_mask
+        channel_padded[:count] = channel_k
+        innovation_padded_now[:count] = innovation_k
+        return (
+            fixed_k,
+            obs_padded,
+            mask_padded,
+            channel_padded,
+            innovation_padded_now,
+        )
+
+    def _expand_recurrent_slot_capacity(
+        recurrent_state: tuple[torch.Tensor, torch.Tensor] | None,
+        slot_capacity: int,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Grow an online h/c slot axis when Data02 exceeds Data01 Nmax."""
+        if recurrent_state is None:
+            return None
+        h_state, c_state = recurrent_state
+        if h_state.ndim != 4 or c_state.ndim != 4:
+            raise ValueError("recurrent h/c must have [layer,B,N,H] shape")
+        if h_state.shape != c_state.shape:
+            raise ValueError("recurrent h/c shapes must match")
+        old_capacity = int(h_state.shape[2])
+        if slot_capacity < old_capacity:
+            raise ValueError("recurrent slot capacity cannot shrink")
+        if slot_capacity == old_capacity:
+            return recurrent_state
+        pad_slots = slot_capacity - old_capacity
+        return (
+            F.pad(h_state, (0, 0, 0, pad_slots)),
+            F.pad(c_state, (0, 0, 0, pad_slots)),
+        )
+
     def _feature_shift_diagnostics(fixed_raw, obs_raw, channel_mask):
         """Compare one Data02 input with the raw Data01 training envelope only."""
         fixed_raw = np.asarray(fixed_raw, dtype=float).reshape(FIXED_FEATURE_DIM)
@@ -5519,9 +5641,10 @@ if __name__ == "__main__":
     #      Eq. (8)+INS sensitivity completion.  Therefore future Eq. (30) losses
     #      supervise earlier KG/eta outputs through BPTT without inventing a
     #      direct KG or eta label.
-    #   5) The Masked LSTM itself remains stateless across fusion epochs.  The
-    #      cross-epoch recurrence differentiated here is the KalmanNet/navigation
-    #      recursion, not an unpublished stateful-LSTM modification.
+    #   5) As in the original KalmanNet pipeline, Masked-LSTM h/c is reset once
+    #      at the trajectory boundary and carried through consecutive fusion
+    #      epochs.  The same recurrence is used by Data01 refinement and Data02
+    #      inference, so BPTT sees the deployed neural-state transition.
     #
     # The locally linearized recursive training path is a reference-guided
     # completion because Yan et al. do not publish their BPTT schedule.
@@ -5579,6 +5702,7 @@ if __name__ == "__main__":
         previous_previous_correction_15 = None
         previous_residual = recursive_warm_previous_residual
         previous_sat_ids = recursive_warm_previous_sat_ids
+        network_recurrent_state = None
 
         eq30_losses = []
         position_squared_errors = []
@@ -5723,7 +5847,9 @@ if __name__ == "__main__":
                 observation_network.unsqueeze(0),
                 satellite_mask.unsqueeze(0),
                 channel_mask.unsqueeze(0),
+                recurrent_state=network_recurrent_state,
             )
+            network_recurrent_state = output.recurrent_state
             correction_15 = fig8_state_update(
                 output,
                 innovation_padded_recursive.unsqueeze(0),
@@ -6033,6 +6159,9 @@ if __name__ == "__main__":
             "recursive_training_reference": (
                 "original_KalmanNet_trajectory_BPTT_reference_guided_completion"
             ),
+            "lstm_trajectory_state": (
+                "explicit_hc_reset_once_then_carried_across_fusion_epochs"
+            ),
             "recursive_training_linearization": (
                 "nu_rec=nu_reference-H*delta_prior; "
                 "delta_prior_next=Phi*delta_post+J_eta*eta"
@@ -6085,6 +6214,9 @@ if __name__ == "__main__":
         diag_eta = np.zeros(IMU_ERROR_DIM)
         diag_rows = []
         diag_fde_stats = _new_fde_stats()
+        diag_previous = None
+        diag_recurrent_state = None
+        diag_warm_start = None
 
         diag_last_gyro, diag_last_accel = compensate_imu(
             imr.angular_rate_body_radps[0],
@@ -6100,16 +6232,6 @@ if __name__ == "__main__":
             diag_nav.gyroscope_bias_body_radps,
             diag_nav.accelerometer_bias_body_mps2,
         )
-        diag_previous = _make_online_context(
-            (),
-            np.empty(0),
-            np.zeros(INS_STATE_DIM),
-            np.zeros(INS_STATE_DIM),
-            diag_feature_accel,
-            diag_feature_gyro,
-            previous_context=None,
-        )
-
         # Keep the main-run Van Loan counters unchanged: this replay is diagnostic
         # and must not contaminate the reported Data01+Data02 numerical statistics.
         van_loan_stats_before_data01_diag = dict(_VAN_LOAN_STATS)
@@ -6171,6 +6293,44 @@ if __name__ == "__main__":
                 prior_error_3d_m = float(
                     np.linalg.norm(prior_position - truth_position_now)
                 )
+
+                # The first usable fusion row is the causal context row, exactly
+                # as in the fixed Data01 construction (history_rows[0]).  It is an
+                # ordinary TC/KF update, is excluded from learned metrics, and
+                # does not advance the neural recurrent state.
+                if diag_previous is None:
+                    warm_model = build_measurement_model(
+                        diag_nav,
+                        diag_measurements,
+                        lever_arm_b_m,
+                    )
+                    warm_correction, diag_P, _ = kalman_measurement_update(
+                        diag_P,
+                        warm_model.innovation,
+                        warm_model.H,
+                        warm_model.R,
+                    )
+                    diag_nav = inject_error_state(diag_nav, warm_correction)
+                    warm_residual = build_innovation_only(
+                        diag_nav,
+                        diag_measurements,
+                        lever_arm_b_m,
+                    )
+                    diag_previous = _make_online_context(
+                        warm_model.sat_ids,
+                        warm_residual,
+                        np.zeros(INS_STATE_DIM),
+                        warm_correction,
+                        diag_feature_accel,
+                        diag_feature_gyro,
+                        previous_context=None,
+                    )
+                    diag_warm_start = {
+                        "method": "ordinary_TC_KF_context_only",
+                        "time_gpst_s": float(t),
+                        "excluded_from_learned_metrics": True,
+                    }
+                    continue
 
                 if FDE_DIA_ON:
                     diag_fde = ref33_fde_dia_decision(
@@ -6243,26 +6403,42 @@ if __name__ == "__main__":
                 feature_shift = _feature_shift_diagnostics(
                     fixed_k_raw, obs_k_raw, channel_k
                 )
+                (
+                    fixed_nn,
+                    obs_nn,
+                    mask_nn,
+                    channel_nn,
+                    innovation_nn,
+                ) = _pad_neural_epoch(
+                    fixed_k,
+                    obs_k,
+                    current_mask,
+                    channel_k,
+                    innovation_k,
+                    nmax,
+                )
 
                 with torch.inference_mode():
                     diag_output = model(
                         torch.tensor(
-                            fixed_k[None], dtype=torch.float32, device=DEVICE
+                            fixed_nn[None], dtype=torch.float32, device=DEVICE
                         ),
                         torch.tensor(
-                            obs_k[None], dtype=torch.float32, device=DEVICE
+                            obs_nn[None], dtype=torch.float32, device=DEVICE
                         ),
                         torch.tensor(
-                            current_mask[None], dtype=torch.bool, device=DEVICE
+                            mask_nn[None], dtype=torch.bool, device=DEVICE
                         ),
                         torch.tensor(
-                            channel_k[None], dtype=torch.bool, device=DEVICE
+                            channel_nn[None], dtype=torch.bool, device=DEVICE
                         ),
+                        recurrent_state=diag_recurrent_state,
                     )
+                    diag_recurrent_state = diag_output.recurrent_state
                     diag_correction = fig8_state_update(
                         diag_output,
                         torch.tensor(
-                            innovation_k[None],
+                            innovation_nn[None],
                             dtype=torch.float32,
                             device=DEVICE,
                         ),
@@ -6385,6 +6561,7 @@ if __name__ == "__main__":
 
         data01_recursive_summary = {
             "epochs": int(len(diag_rows)),
+            "causal_warm_start": diag_warm_start,
             "rmse_n_e_d_3d_m": [float(x) for x in diag_rmse],
             "first_spectral_radius_gt_1": _diag_first(diag_rho > 1.0),
             "first_error_gt_100m": _diag_first(diag_error_3d > 100.0),
@@ -6670,6 +6847,9 @@ if __name__ == "__main__":
     current_eta_test = np.zeros(IMU_ERROR_DIM)
     online_rows = []
     previous_online = None
+    test_recurrent_state = None
+    test_recurrent_capacity = int(nmax)
+    test_warm_start = None
     test_fde_stats = _new_fde_stats()
 
     last_gyro, last_accel = compensate_imu(
@@ -6685,15 +6865,6 @@ if __name__ == "__main__":
         test_imr.acceleration_body_mps2[0],
         nav.gyroscope_bias_body_radps,
         nav.accelerometer_bias_body_mps2,
-    )
-    previous_online = _make_online_context(
-        (),
-        np.empty(0),
-        np.zeros(INS_STATE_DIM),
-        np.zeros(INS_STATE_DIM),
-        last_feature_accel,
-        last_feature_gyro,
-        previous_context=None,
     )
     test_timeline = build_exact_fusion_timeline(
         test_imr_time,
@@ -6752,6 +6923,47 @@ if __name__ == "__main__":
         truth_position_now = test_fusion_antenna_truth_position[fusion_index]
         prior_position = gnss_antenna_position(nav, test_lever_arm_b_m)
         prior_error_3d_m = float(np.linalg.norm(prior_position - truth_position_now))
+
+        # Eqs. (11)-(14) require a completed preceding fusion epoch.  Data01
+        # training obtains that context from history_rows[0], so Data02 must not
+        # manufacture an all-zero predecessor and feed it to the learned model.
+        # One ordinary TC/KF update establishes the causal context, exactly like
+        # the original KalmanNet InitSequence boundary.  It is excluded from all
+        # learned test metrics and does not advance the neural recurrent state.
+        if previous_online is None:
+            warm_measurement_model = build_measurement_model(
+                nav,
+                measurements,
+                test_lever_arm_b_m,
+            )
+            warm_correction, P, _ = kalman_measurement_update(
+                P,
+                warm_measurement_model.innovation,
+                warm_measurement_model.H,
+                warm_measurement_model.R,
+            )
+            nav = inject_error_state(nav, warm_correction)
+            warm_posterior_residual = build_innovation_only(
+                nav,
+                measurements,
+                test_lever_arm_b_m,
+            )
+            previous_online = _make_online_context(
+                warm_measurement_model.sat_ids,
+                warm_posterior_residual,
+                np.zeros(INS_STATE_DIM),
+                warm_correction,
+                last_feature_accel,
+                last_feature_gyro,
+                previous_context=None,
+            )
+            test_warm_start = {
+                "method": "ordinary_TC_KF_context_only",
+                "time_gpst_s": float(t),
+                "excluded_from_learned_metrics": True,
+                "neural_state_advanced": False,
+            }
+            continue
 
         # ================================================================
         # OPTIONAL FDE / DIA BLOCK — the only algorithmic ON/OFF branch.
@@ -6865,8 +7077,9 @@ if __name__ == "__main__":
                 )
             continue
 
-        # The training and test paths use the same zero-history initialization.
-        # No classical KF warm-start is inserted before the first KNet update.
+        # The first learned update now sees the same kind of completed preceding
+        # context as the first Data01 training sample.  Neural h/c is still zero
+        # here and begins its recurrence at this first learned epoch.
 
         # Training normalization is still fixed from training only, but the
         # Masked CLA gain head is slot-shared and therefore accepts the current
@@ -6916,31 +7129,54 @@ if __name__ == "__main__":
             if innovation_k.size else 0.0
         )
 
+        if n > test_recurrent_capacity:
+            test_recurrent_capacity = int(n)
+            test_recurrent_state = _expand_recurrent_slot_capacity(
+                test_recurrent_state,
+                test_recurrent_capacity,
+            )
+        (
+            fixed_nn,
+            obs_nn,
+            mask_nn,
+            channel_nn,
+            innovation_nn,
+        ) = _pad_neural_epoch(
+            fixed_k,
+            obs_k,
+            current_mask,
+            channel_k,
+            innovation_k,
+            test_recurrent_capacity,
+        )
+
         with torch.inference_mode():
             output = model(
                 torch.tensor(
-                    fixed_k[None],
+                    fixed_nn[None],
                     dtype=torch.float32,
                     device=DEVICE,
                 ),
                 torch.tensor(
-                    obs_k[None],
+                    obs_nn[None],
                     dtype=torch.float32,
                     device=DEVICE,
                 ),
                 torch.tensor(
-                    current_mask[None],
+                    mask_nn[None],
                     dtype=torch.bool,
                     device=DEVICE,
                 ),
                 torch.tensor(
-                    channel_k[None],
+                    channel_nn[None],
                     dtype=torch.bool,
                     device=DEVICE,
                 ),
+                recurrent_state=test_recurrent_state,
             )
+            test_recurrent_state = output.recurrent_state
             innovation_tensor = torch.tensor(
-                innovation_k[None],
+                innovation_nn[None],
                 dtype=torch.float32,
                 device=DEVICE,
             )
@@ -7444,7 +7680,10 @@ if __name__ == "__main__":
                 "paper_difference": "Yan_Eq4_CN0_dependent_MP_NLOS_not_used_in_LEO_branch",
             },
             "INS_Eq6_to_Eq9": "15_state_ECEF_error_model_plus_Eq8_compensation_and_lever_arm",
-            "MaskedCLA_Eq10_to_Eq29": "implemented_with_Fig8_pool_flatten_and_per_epoch_masked_LSTM",
+            "MaskedCLA_Eq10_to_Eq29": (
+                "implemented_with_Fig8_pool_flatten_masked_LSTM_and_explicit_"
+                "trajectory_hc_state"
+            ),
             "training_Eq30_to_Eq32": "Yan_fixed_Data01_warmstart_plus_KalmanNet_reference_guided_recursive_full_trajectory_BPTT_ref15_alternating",
             "Fig8_eta": {
                 "enabled": True,
@@ -7483,6 +7722,7 @@ if __name__ == "__main__":
             "Data01_only_feature_standardization_Yan_does_not_publish_input_scaling",
             "eta_timing_Yan_unpublished_future_state_supervision_completion_no_direct_eta_MSE",
             "recursive_full_trajectory_BPTT_schedule_from_original_KalmanNet_reference_Yan_exact_schedule_unpublished",
+            "per_slot_LSTM_hc_tensorization_across_fusion_epochs_from_Eq25_and_original_KalmanNet_sequence_contract",
             "recursive_TC_linearization_about_classical_Data01_reference_trajectory",
             "LEO_variance_intentionally_kept_as_v6_instead_of_Yan_Eq4",
             "random_LEO_masking_angle_distribution_from_Ref43",
@@ -7521,6 +7761,10 @@ if __name__ == "__main__":
                 ),
                 "scope": "Data01_only_complete_usable_fusion_trajectory",
                 "gradient": "full_trajectory_BPTT",
+                "neural_recurrent_state": (
+                    "h_c_reset_once_at_Data01_trajectory_start_and_carried_"
+                    "across_usable_fusion_epochs"
+                ),
                 "feature_recursion": (
                     "network_previous_correction_and_residual_generate_"
                     "Yan_Eq11_to_Eq13_inputs"
@@ -7556,6 +7800,10 @@ if __name__ == "__main__":
         },
         "test": {
             "epochs": int(len(online_rows)),
+            "causal_warm_start": test_warm_start,
+            "neural_recurrent_state": (
+                "h_c_reset_after_context_epoch_then_carried_across_learned_epochs"
+            ),
             "rmse_ned3d_m": [float(v) for v in rmse],
             "eta_feedback_enabled": bool(ETA_FEEDBACK_ON),
             "divergence_diagnostics": divergence_diagnostics,
