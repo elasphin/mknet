@@ -190,7 +190,7 @@ LEO_TX_MAX_ITERATIONS = 20
 #
 # Keep True for the paper-reproduction run. Use False only as an ablation run
 # to measure the effect of adding/removing the FDE/DIA block.
-FDE_DIA_ON = True
+FDE_DIA_ON = False
 
 # Runtime/accuracy trade-off controls.
 # The final scientific LEO mask remains exactly LEO_MIN_ELEVATION_DEG.  This guard is
