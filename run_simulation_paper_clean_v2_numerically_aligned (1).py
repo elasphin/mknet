@@ -3813,7 +3813,7 @@ if __name__ == "__main__":
     # to roughly 500 training epochs, but the text does not publish an exact
     # stopping epoch. Therefore 500 is used only as a maximum figure-guided
     # training horizon.
-    TRAINING_EPOCHS = 500
+    TRAINING_EPOCHS = 10
     BATCH_SIZE = 32  # unpublished; explicit reproducibility completion
     LEARNING_RATE = 0.01
     # Ref. [15] permits separate learning rates for its two alternating blocks,
@@ -3834,7 +3834,7 @@ if __name__ == "__main__":
     # epochs are strongly correlated; a random split would leak near-duplicate
     # temporal context between train and validation.
     VALIDATION_FRACTION = 0.20
-    EARLY_STOP_PATIENCE = 25
+    EARLY_STOP_PATIENCE = 5
     EARLY_STOP_MIN_DELTA = 0.0
 
     # Keep the paper-supported Adam initial LR fixed. No unpublished LR scheduler
@@ -3934,7 +3934,7 @@ if __name__ == "__main__":
             allowed_constellations={"G", "C"},
             start_time_gpst_s=usable_imu_start,
             end_time_gpst_s=common_end,
-            max_epochs=None,
+            max_epochs=100,
             require_measurements=True,
         )
     )
@@ -5218,7 +5218,7 @@ if __name__ == "__main__":
             allowed_constellations={"G", "C"},
             start_time_gpst_s=test_usable_imu_start,
             end_time_gpst_s=test_common_end,
-            max_epochs=None,
+            max_epochs=100,
             require_measurements=True,
         )
     )
