@@ -29,14 +29,20 @@ Published components retained/restored in this revision include:
   post-exclusion rejection loop;
 - covariance-based HPL/VPL outputs for the PL/Stanford branch using the explicit
   Ref. [35] HPL/VPL equations;
-- closed-loop spectral-radius logging for the stability analysis.
+- stability-diagnostic output fields matching Yan Fig. 10. Yan et al. do not
+  publish the square closed-loop operator whose spectral radius is plotted, so
+  those fields remain unavailable rather than substituting the invalid I-KH
+  correction operator or an invented transition formula.
 
 This revision keeps the non-invasive divergence diagnostics and replaces the
 v23 linearized cross-fusion training surrogate with the actual GNSS/LEO/INS forward
 navigation loop shown by Yan et al. in Figs. 7-8:
 - Yan's Eqs. (10)-(21) remain the source of the physical feature definitions and
-  zero-padding/masks. Each padded X_bar[k] is still processed as one intra-epoch
-  masked sequence: CNN -> pooling/flatten -> masked LSTM -> attention -> FC.
+  zero-padding/masks. Each padded X_bar[k] is processed as one masked sequence:
+  CNN -> pooling/flatten -> masked LSTM -> attention -> FC. In accordance with
+  Eqs. (24)-(25), the final valid LSTM hidden/cell state is carried from fusion
+  epoch k to k+1 inside each chronological trajectory; padded or unavailable
+  epochs leave that state unchanged.
 - Raw Data01 observations, truth, timestamps, masks, and simulated LEO pseudoranges
   are fixed.  Estimator-dependent Eqs. (10)-(13) are NOT frozen: during training
   they are rebuilt causally from the current learned navigation trajectory, so the
@@ -46,14 +52,12 @@ navigation loop shown by Yan et al. in Figs. 7-8:
   Data02 path.  The v23 Phi*delta_x / H*delta_x surrogate is removed from training;
   no stored linearized state-transition or measurement-Jacobian recurrence is used
   to manufacture the next network input.
-- Yan et al. publish an epoch-wise supervised state loss and backpropagation to K_k,
-  but do not publish cross-fusion BPTT through the complete INS mechanization.  The
-  exact NumPy navigation state is therefore detached between fusion epochs: each
-  Eq. (30) loss backpropagates through the current Masked-CLA -> KG -> state-update
-  path, while the detached learned posterior is physically propagated to generate
-  the next prior/features.  This is an explicit implementation completion chosen
-  to preserve the published forward navigation order without inventing a second
-  linearized dynamics model.
+- Yan et al. publish an epoch-wise supervised state loss and recurrent LSTM state,
+  but do not publish cross-fusion differentiation through the complete INS
+  mechanization. The exact NumPy navigation state therefore remains detached
+  between fusion epochs. Within each short trajectory, however, the LSTM h/c graph
+  is retained, so later Eq. (30) losses backpropagate through the published neural
+  recurrence without inventing a second linearized navigation dynamics model.
 - To avoid changing network parameters in the middle of one physical navigation
   trajectory, Data01 is segmented into short independent training trajectories.
   This adopts only the trajectory-batching principle of KalmanNet V2: each short
@@ -86,13 +90,17 @@ navigation loop shown by Yan et al. in Figs. 7-8:
 This CNN/LSTM revision retains the Pooling and Flatten stages drawn explicitly in
 Yan Fig. 8. The mask controls valid positions inside each padded X_bar[k]. Because
 valid entries form a contiguous prefix, packed-sequence LSTM evaluation is used:
-valid positions update the recurrent state and padded suffix positions are skipped,
-which is the simple implementation of the behavior described around Eqs. (24)-(25).
-The exact pooling operator remains unpublished; the implemented same-length masked
-max-pool is labelled as a Fig.-8-guided completion.
+valid positions update the recurrent state, padded suffix positions are skipped,
+and the resulting h/c is carried to the next fusion epoch in that trajectory, as
+described around Eqs. (24)-(25). The exact pooling operator remains unpublished;
+the implemented same-length masked max-pool is labelled as a Fig.-8-guided
+completion.
 
-The separate post-training recursive Data01 rollout remains diagnostic only and
-never updates a network parameter or feeds information into Data02.
+The separate post-training recursive Data01 rollout never updates a network
+parameter or feeds a Data01 sample into Data02. Its same-epoch 3-D RMSE is an
+acceptance gate before independent testing: consistent with Yan Fig. 9(a), the
+recursive learned result must not be worse than the classical TC/KF posterior on
+the identical Data01 epochs. No unpublished absolute-error threshold is used.
 
 This revision also hardens diagnostic/integrity bookkeeping without changing any
 navigation or neural-network equation:
@@ -276,11 +284,13 @@ FDE_DIA_ON = True
 # the divergence, so the paper-path behavior is restored here.
 ETA_FEEDBACK_ON = True
 
-# Diagnostic only: after training, replay Data01 recursively with the trained
-# Masked-CLA using the SAME online closed-loop logic used for Data02.  This does
-# not train on the rollout, modify any model weight, replace any paper equation,
-# or feed Data01 diagnostic results into Data02.  It only distinguishes
-# fixed-offline-training instability from cross-dataset generalization failure.
+# Read-only acceptance gate: after training, replay Data01 recursively with the
+# trained Masked-CLA using the SAME online closed-loop logic used for Data02. This
+# does not train on the rollout, modify a model weight, replace a paper equation,
+# or pass a Data01 sample to Data02. It compares learned and classical TC/KF 3-D
+# RMSE on identical Data01 epochs and blocks Data02 if the learned recursive result
+# is worse, matching the qualitative comparison in Yan Fig. 9(a) without inventing
+# an absolute-error threshold.
 RUN_RECURSIVE_DATA01_DIAGNOSTIC = True
 
 # The classical Data02 baseline was already verified stable (~7.84 m 3D RMSE in
@@ -2572,8 +2582,9 @@ def _yan_eq34_dia_adaptation(
 
     This is evaluated inside the classical DIA inference branch, where the
     orthogonality assumptions used by Ref. [33] hold. The resulting adapted
-    state/covariance are retained for integrity/PL bookkeeping; the proposed
-    Masked-CLA navigation update still uses the post-exclusion learned KG.
+    state/covariance are retained as DIA diagnostics. They are not used for PL
+    unless their matching state correction is applied to the reported state;
+    the proposed Masked-CLA navigation update uses the post-exclusion learned KG.
     """
     Pm = np.asarray(prior_covariance, dtype=float)
     H = np.asarray(model.H, dtype=float)
@@ -3025,19 +3036,76 @@ def protection_levels_from_covariance(
 
 
 def closed_loop_spectral_radius(gain: Array, H: Array) -> float:
-    """Spectral radius of the square correction operator I-KH.
+    """Return unavailable until Yan's square stability operator is specified.
 
     Yan Sec. II-E reports a closed-loop spectral-radius stability diagnostic but
-    does not print the exact matrix expression. I-KH is the dimensionally valid
-    KF correction operator associated with the learned gain and is logged here
-    as the explicit diagnostic completion.
+    does not print the matrix expression used for Fig. 10. The former completion
+    used I-KH. That matrix is not a valid reproduction here: this 15-state
+    pseudorange H has unobserved velocity/bias directions, so every vector in
+    null(H) is a unit-eigenvalue direction of I-KH and its radius cannot reproduce
+    Yan's reported values below one. Adding Phi, selecting a state subspace, or
+    using a gain norm would each be a different unpublished assumption.
+
+    Keep the existing result-column interface, but return NaN so downstream files
+    state that the metric is unavailable rather than reporting a false Fig. 10
+    reproduction. The inputs are still shape-checked to catch call-site mistakes.
     """
     K = np.asarray(gain, dtype=float)
     Hm = np.asarray(H, dtype=float)
     if K.ndim != 2 or Hm.ndim != 2 or K.shape[1] != Hm.shape[0]:
         return float("nan")
-    Acl = np.eye(K.shape[0]) - K @ Hm
-    return float(np.max(np.abs(np.linalg.eigvals(Acl))))
+    return float("nan")
+
+
+def recursive_same_epoch_rmse_gate(
+    learned_error_3d_m: Array,
+    classical_error_3d_m: Array,
+) -> dict:
+    """Paper-guided recursive Data01 acceptance against same-epoch TC/KF.
+
+    Yan Fig. 9(a) reports the proposed recursive solution as consistently more
+    accurate than the traditional KF. The paper gives no absolute acceptance
+    threshold, so this gate introduces none: all compared epochs must have finite
+    learned and classical errors, and learned 3-D RMSE must not exceed the
+    classical 3-D RMSE on exactly those epochs.
+    """
+    learned = np.asarray(learned_error_3d_m, dtype=float).reshape(-1)
+    classical = np.asarray(classical_error_3d_m, dtype=float).reshape(-1)
+    if learned.shape != classical.shape or learned.size == 0:
+        return {
+            "passed": False,
+            "reason": "missing_or_misaligned_same_epoch_errors",
+            "epochs_compared": 0,
+            "learned_rmse_3d_m": None,
+            "classical_rmse_3d_m": None,
+        }
+
+    finite = np.isfinite(learned) & np.isfinite(classical)
+    if not np.all(finite):
+        return {
+            "passed": False,
+            "reason": "nonfinite_or_missing_same_epoch_error",
+            "epochs_compared": int(np.count_nonzero(finite)),
+            "learned_rmse_3d_m": None,
+            "classical_rmse_3d_m": None,
+        }
+
+    learned_rmse = float(np.sqrt(np.mean(learned**2)))
+    classical_rmse = float(np.sqrt(np.mean(classical**2)))
+    passed = bool(learned_rmse <= classical_rmse)
+    return {
+        "passed": passed,
+        "reason": (
+            "learned_rmse_not_worse_than_classical"
+            if passed else "learned_rmse_worse_than_classical"
+        ),
+        "epochs_compared": int(learned.size),
+        "learned_rmse_3d_m": learned_rmse,
+        "classical_rmse_3d_m": classical_rmse,
+        "criterion": "learned_same_epoch_rmse_3d_m <= classical_same_epoch_rmse_3d_m",
+        "paper_basis": "Yan_Fig9a_qualitative_learned_error_below_traditional_KF",
+        "absolute_threshold_used": False,
+    }
 
 
 def _so3_left_jacobian(rotation_vector_rad: Array) -> Array:
@@ -3522,8 +3590,9 @@ class LEODownlinkSimulator:
 #   - CNN/Pooling/Flatten are applied to each epoch independently;
 #   - the masked LSTM recurrence runs only over the valid t-prefix of X_bar[k];
 #   - Eq. (25)'s mask behavior is implemented by skipping the padded suffix;
-#   - hidden/cell state is local to one X_bar[k] call and is not carried between
-#     navigation fusion epochs or shared between Data01 and Data02.
+#   - the final valid hidden/cell state is carried from fusion epoch k to k+1
+#     within one chronological trajectory, while independent trajectories and
+#     Data01/Data02 always start from a fresh recurrent state.
 #
 # Explicit project completions that remain because Yan et al. do not publish them:
 #   - one pseudorange-only satellite slot is represented by
@@ -3566,13 +3635,14 @@ class MaskedCLAOutput:
     kalman_gain : [B, 15, Nmax]
     imu_error   : [B, 6] -- eta_k = [epsilon_g(3) rad/s, epsilon_a(3) m/s^2]
     attention   : [B, Nmax]
-    recurrent_state : None (no cross-fusion hidden-state carry)
+    recurrent_state : tuple(h, c), each [layers, B, hidden]
+        Final valid LSTM state to carry to fusion epoch k+1 in the same trajectory.
     """
 
     kalman_gain: torch.Tensor
     imu_error: torch.Tensor
     attention: torch.Tensor
-    recurrent_state: None = None
+    recurrent_state: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 class MaskedConv1d(nn.Module):
@@ -3681,14 +3751,16 @@ class MaskedConv1d(nn.Module):
 
 
 class MaskedStackedLSTM(nn.Module):
-    """Yan Eqs. (24)-(25): masked LSTM over one padded fusion-epoch sequence.
+    """Yan Eqs. (24)-(25): masked recurrent LSTM over fusion epochs.
 
     Each call receives one or more padded X_bar[k] sequences with shape [B,N,C].
     The valid mask is a contiguous prefix [1,...,1,0,...,0], as constructed by
     Yan Eqs. (16)-(21). A standard stacked LSTM is therefore evaluated only over
     the valid prefix using ``pack_padded_sequence``. The padded suffix never
-    updates h/c and its returned features are forced to zero. Hidden/cell state
-    is local to this call and is not carried to the next navigation fusion epoch.
+    updates h/c and its returned features are forced to zero. The final valid h/c
+    is returned for fusion epoch k+1. This gives the recurrent temporal continuity
+    described by Eq. (25), while a completely masked/unavailable epoch is handled
+    by the caller retaining the preceding state without invoking this module.
     """
 
     def __init__(
@@ -3722,12 +3794,7 @@ class MaskedStackedLSTM(nn.Module):
         x: torch.Tensor,
         mask: torch.Tensor,
         recurrent_state: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, None]:
-        if recurrent_state is not None:
-            raise ValueError(
-                "cross-fusion recurrent_state is intentionally disabled; "
-                "each fusion epoch is one masked LSTM sequence"
-            )
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         if x.ndim != 3 or mask.ndim != 2:
             raise ValueError(
                 "MaskedStackedLSTM expects x=[B,N,C] and mask=[B,N]"
@@ -3740,6 +3807,25 @@ class MaskedStackedLSTM(nn.Module):
         batch_size, slot_count = x.shape[:2]
         if slot_count <= 0:
             raise ValueError("MaskedStackedLSTM requires a non-empty sequence")
+
+        if recurrent_state is not None:
+            if len(recurrent_state) != 2:
+                raise ValueError("recurrent_state must be the (hidden, cell) pair")
+            expected_state_shape = (
+                self.num_layers,
+                batch_size,
+                self.hidden_size,
+            )
+            for name, state in zip(("hidden", "cell"), recurrent_state):
+                if tuple(state.shape) != expected_state_shape:
+                    raise ValueError(
+                        f"recurrent {name} must have shape {expected_state_shape}, "
+                        f"got {tuple(state.shape)}"
+                    )
+                if state.device != x.device or state.dtype != x.dtype:
+                    raise ValueError(
+                        f"recurrent {name} must match the input device and dtype"
+                    )
 
         valid = mask.bool()
         lengths = valid.sum(dim=1)
@@ -3760,14 +3846,17 @@ class MaskedStackedLSTM(nn.Module):
             batch_first=True,
             enforce_sorted=False,
         )
-        packed_output, _ = self.lstm(packed)
+        packed_output, next_recurrent_state = self.lstm(
+            packed,
+            recurrent_state,
+        )
         output, _ = nn.utils.rnn.pad_packed_sequence(
             packed_output,
             batch_first=True,
             total_length=slot_count,
         )
         output = output * valid.unsqueeze(-1).to(dtype=output.dtype)
-        return output, None
+        return output, next_recurrent_state
 
 
 class MaskedAttention(nn.Module):
@@ -3840,8 +3929,9 @@ class MaskedCLA(nn.Module):
 
     Each X_bar[k] is one padded observation sequence. The masked CNN processes
     its valid slots, and the masked LSTM runs along those slots inside the same
-    fusion epoch. Hidden/cell state is reset for the next X_bar[k+1]; Yan et al.
-    do not publish a cross-fusion h/c carry, so none is introduced here.
+    fusion epoch. The final valid hidden/cell state is carried to X_bar[k+1]
+    within a chronological trajectory, following the temporal continuity in Yan
+    Eqs. (24)-(25). Independent trajectories start from a fresh state.
 
     Yan's Eqs. (18)-(20) define the labeled Data01 trajectory and masking. During
     training, short Data01 trajectories are replayed chronologically with the same
@@ -3998,7 +4088,7 @@ class MaskedCLA(nn.Module):
         conv_flat = self.conv(token, mask_values)
 
         # Yan Eqs. (24)-(25): masked recurrent processing inside the current
-        # padded X_bar[k] sequence. No h/c is carried to the next fusion epoch.
+        # padded X_bar[k], with final valid h/c carried to fusion epoch k+1.
         lstm, next_recurrent_state = self.lstm(
             conv_flat,
             mask_values,
@@ -4083,15 +4173,15 @@ if __name__ == "__main__":
     OUTPUT_DIR = _default_output_dir()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    MAX_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_FUSION_EPOCHS", 300)
-    MAX_TEST_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_TEST_FUSION_EPOCHS", 100)
+    MAX_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_FUSION_EPOCHS", None)
+    MAX_TEST_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_TEST_FUSION_EPOCHS", None)
 
     # Table III explicitly gives Adam, initial LR=0.01, Conv=24,
     # LSTM=64 x 5, and dropout=0.2. Fig. 15 displays learning curves extending
     # to roughly 500 training epochs, but the text does not publish an exact
     # stopping epoch. Therefore 500 is used only as a maximum figure-guided
     # training horizon.
-    TRAINING_EPOCHS = _env_int("MKNET_TRAINING_EPOCHS", 30)
+    TRAINING_EPOCHS = _env_int("MKNET_TRAINING_EPOCHS", 500)
     # Yan et al. do not publish the mini-batch size or a cross-fusion training
     # segmentation.  KalmanNet, however, trains recursive estimators on batches of
     # trajectories and its V2 example divides long trajectories into shorter ones
@@ -4167,11 +4257,11 @@ if __name__ == "__main__":
         "mechanization -> next GNSS/LEO innovation/features; "
         f"trajectory_length={TRAINING_TRAJECTORY_LENGTH}; "
         f"trajectory_batch_requested={BATCH_SIZE}; no optimizer step inside a trajectory; "
-        "no Phi/H cross-fusion surrogate; Masked-CLA LSTM remains intra-epoch",
+        "no Phi/H cross-fusion surrogate; Masked-CLA h/c is carried within each trajectory",
     )
     print(
         "Training gradient scope:",
-        "Yan Eq.(30)/(32) backpropagates through the current Masked-CLA/KG update; "
+        "Yan Eq.(30)/(32) backpropagates through the Masked-CLA h/c recurrence; "
         "the exact NumPy navigation state is detached between fusion epochs because "
         "Yan does not publish full-INS cross-fusion BPTT",
     )
@@ -4781,16 +4871,18 @@ if __name__ == "__main__":
     #   (1) Yan et al.: Fig. 7/8 forward navigation order, Eqs. (10)-(21) features,
     #       Masked-CLA architecture, Eq. (30)/(32), Adam LR, alternating training.
     #   (2) KalmanNet: retain the learned filter as a recursive estimator whose
-    #       current posterior produces the next prior/features.  Its V2 principle
-    #       is used only to form short independent training trajectories/batches;
-    #       unlike v23, no Phi/H truncated-BPTT surrogate is used.
+    #       current posterior produces the next prior/features. Its V2 principle
+    #       is used to form short independent training trajectories/batches and
+    #       bound BPTT through the Masked-CLA h/c recurrence; unlike v23, no Phi/H
+    #       truncated-BPTT surrogate is used.
     #   (3) Latent-KalmanNet: alternating optimization of filter and representation
     #       parameter blocks using the same state-estimation objective.
     #
-    # The Masked-CLA LSTM remains intra-epoch. Across fusion epochs the *forward*
-    # navigation state is recursive and uses the same physical INS mechanization as
-    # Data02. The NumPy navigation state is detached between fusion epochs; hence no
-    # unpublished Phi/H surrogate or full-INS BPTT is introduced.
+    # The Masked-CLA final valid h/c is carried across fusion epochs within each
+    # short trajectory and participates in BPTT. The forward navigation state is
+    # also recursive and uses the same physical INS mechanization as Data02, but its
+    # NumPy representation is detached; hence no unpublished Phi/H surrogate or
+    # full-INS differentiation is introduced.
     model = MaskedCLA(nmax=nmax, dropout=0.2).to(DEVICE)
     # Yan et al. do not publish the FC-head initialization.  A zero initial KG is
     # the neutral navigation action (no arbitrary random state injection) and lets
@@ -4811,7 +4903,7 @@ if __name__ == "__main__":
     )
     print(
         "LSTM cross-fusion h/c carry:",
-        "OFF -- external estimator state is recursive; Masked-CLA h/c resets for each X_bar[k]",
+        "ON within each chronological trajectory; reset at independent trajectory boundaries",
     )
     print(
         "Kalman gain output:",
@@ -5094,6 +5186,7 @@ if __name__ == "__main__":
         last_feature_accel = previous_context["accel"].copy()
         last_feature_gyro = previous_context["gyro"].copy()
         recurrent_capacity = int(nmax)
+        recurrent_state = None
 
         state_losses: list[torch.Tensor] = []
         total_state_sum = 0.0
@@ -5233,8 +5326,9 @@ if __name__ == "__main__":
                     torch.tensor(
                         channel_nn[None], dtype=torch.bool, device=DEVICE
                     ),
-                    recurrent_state=None,
+                    recurrent_state=recurrent_state,
                 )
+                recurrent_state = output.recurrent_state
                 correction = fig8_state_update(
                     output,
                     torch.tensor(
@@ -5542,10 +5636,11 @@ if __name__ == "__main__":
         return metrics
 
     def _evaluate_teacher_forced_eq30():
-        """Clean Yan X/M/Y one-step metric retained only for diagnostics."""
+        """Clean sequential Yan X/M/Y metric retained only for diagnostics."""
         model.eval()
         state_sum = 0.0
         position_sum = 0.0
+        recurrent_state = None
         with torch.inference_mode():
             for sample_index in range(training_sample_count):
                 output = model(
@@ -5561,8 +5656,9 @@ if __name__ == "__main__":
                     ),
                     satellite_masks_t[sample_index].unsqueeze(0),
                     channel_masks_t[sample_index].unsqueeze(0),
-                    recurrent_state=None,
+                    recurrent_state=recurrent_state,
                 )
+                recurrent_state = output.recurrent_state
                 correction = fig8_state_update(
                     output,
                     innovation_base_t[sample_index]
@@ -5953,7 +6049,7 @@ if __name__ == "__main__":
                 key: value.detach().cpu().clone()
                 for key, value in model.state_dict().items()
             },
-            "checkpoint_schema": "full_15_state_gain_actual_closed_loop_v25_short_trajectory",
+            "checkpoint_schema": "full_15_state_gain_actual_closed_loop_v27_temporal_lstm",
             "nmax": nmax,
             "eq7_state_order": "[delta_p,delta_v,delta_theta,b_a,b_g]",
             "kalman_gain_state_dimension": INS_STATE_DIM,
@@ -5978,20 +6074,22 @@ if __name__ == "__main__":
             ),
             "training_stage_selected": selected_training_stage,
             "training_epochs": best_epoch,
+            "requires_recursive_Data01_gate_before_Data02": True,
             "sequence_training": (
                 "Yan_Fig7_Fig8_actual_closed_loop_forward_inside_short_Data01_"
                 "trajectories;learned_posterior_to_Eq8_IMU_compensation_to_ECEF_INS_"
-                "to_next_features;KalmanNet_V2_guided_segmentation_only;"
-                "no_Phi_H_surrogate;current_epoch_Eq30_gradient_only"
+                "to_next_features;KalmanNet_V2_guided_short_trajectory_hc_BPTT;"
+                "no_Phi_H_surrogate;navigation_state_detached"
             ),
             "training_trajectory_length": int(TRAINING_TRAJECTORY_LENGTH),
             "training_trajectory_count": int(trajectory_count),
             "trajectory_batch_size": int(TRAJECTORY_BATCH_SIZE),
             "optimizer_step_inside_trajectory": False,
             "cross_fusion_navigation_gradient": "detached_unpublished_by_Yan",
+            "cross_fusion_neural_gradient": "LSTM_h_c_BPTT_within_short_trajectory",
             "synthetic_prior_augmentation": False,
             "lstm_trajectory_state": (
-                "no_cross_fusion_hc_state_each_Xbar_k_is_one_sequence"
+                "final_valid_hc_carried_between_Xbar_k_calls_within_trajectory"
             ),
             "external_filter_state": (
                 "recursive_within_each_short_training_trajectory_via_actual_INS;"
@@ -6018,12 +6116,11 @@ if __name__ == "__main__":
     # =========================================================================
     # 8A. POST-TRAINING RECURSIVE DATA01 DIAGNOSTIC
     # =========================================================================
-    # DIAGNOSTIC ONLY. The Data01 actual closed-loop training has finished
-    # before this point. This replay uses model.eval()+inference_mode(), never updates a
-    # parameter, and is not a model-selection stage. Its purpose is only to test
-    # whether the final trained
-    # network remains stable when its own posterior history recursively generates
-    # the next Eqs. (11)-(14) inputs on the SAME Data01 trajectory.
+    # READ-ONLY ACCEPTANCE GATE. Data01 training has finished before this point.
+    # This replay uses model.eval()+inference_mode() and never updates a parameter.
+    # It tests whether the final network remains stable when its own posterior
+    # recursively generates the next Eqs. (11)-(14) inputs, then compares its 3-D
+    # RMSE with the stored classical TC/KF posterior on identical Data01 epochs.
     if RUN_RECURSIVE_DATA01_DIAGNOSTIC:
         print("\n=== RECURSIVE DATA01 CLOSED-LOOP DIAGNOSTIC ===")
         print("mode: trained Masked-CLA replay on Data01; weights frozen")
@@ -6052,6 +6149,13 @@ if __name__ == "__main__":
         diag_fde_stats = _new_fde_stats()
         diag_previous = None
         diag_warm_start = None
+        diag_recurrent_state = None
+        classical_position_by_fusion_index = {
+            int(row["fusion_index"]): gnss_antenna_position(
+                row["posterior_nav"], lever_arm_b_m
+            )
+            for row in history_rows
+        }
 
         diag_last_gyro, diag_last_accel = compensate_imu(
             imr.angular_rate_body_radps[0],
@@ -6128,6 +6232,13 @@ if __name__ == "__main__":
                 prior_error_3d_m = float(
                     np.linalg.norm(prior_position - truth_position_now)
                 )
+                classical_position_now = classical_position_by_fusion_index.get(
+                    int(fusion_index)
+                )
+                classical_error_3d_m = (
+                    float(np.linalg.norm(classical_position_now - truth_position_now))
+                    if classical_position_now is not None else float("nan")
+                )
 
                 # The first usable fusion row is the causal context row, exactly
                 # as in the fixed Data01 construction (history_rows[0]).  It is an
@@ -6199,6 +6310,7 @@ if __name__ == "__main__":
                         "truth": truth_position_now.copy(),
                         "prior_error_3d_m": prior_error_3d_m,
                         "posterior_error_3d_m": prior_error_3d_m,
+                        "classical_posterior_error_3d_m": classical_error_3d_m,
                         "spectral_radius_knet": float("nan"),
                         "gain_fro_norm": float("nan"),
                         # No learned correction is applied when FDE leaves no
@@ -6279,8 +6391,9 @@ if __name__ == "__main__":
                         torch.tensor(
                             channel_nn[None], dtype=torch.bool, device=DEVICE
                         ),
-                        recurrent_state=None,
+                        recurrent_state=diag_recurrent_state,
                     )
+                    diag_recurrent_state = diag_output.recurrent_state
                     diag_correction = fig8_state_update(
                         diag_output,
                         torch.tensor(
@@ -6370,6 +6483,7 @@ if __name__ == "__main__":
                     "truth": truth_position_now.copy(),
                     "prior_error_3d_m": prior_error_3d_m,
                     "posterior_error_3d_m": posterior_error_3d_m,
+                    "classical_posterior_error_3d_m": classical_error_3d_m,
                     "spectral_radius_knet": rho_knet,
                     "gain_fro_norm": float(np.linalg.norm(active_gain)),
                     "gain_bias_rows_fro_norm": diag_gain_bias_rows_fro_norm,
@@ -6406,13 +6520,14 @@ if __name__ == "__main__":
             )
 
         # Every recursive-Data01 branch must export the same bookkeeping fields.
-        # This check is diagnostic-only and does not modify navigation, FDE, or
+        # This read-only check does not modify navigation, FDE, or
         # neural-network behavior; it prevents a later opaque KeyError if a branch
         # forgets one of the CSV/summary fields.
         diag_fields = (
             "time",
             "prior_error_3d_m",
             "posterior_error_3d_m",
+            "classical_posterior_error_3d_m",
             "spectral_radius_knet",
             "gain_fro_norm",
             "gain_bias_rows_fro_norm",
@@ -6442,9 +6557,17 @@ if __name__ == "__main__":
             )
 
         diag_error_3d = np.linalg.norm(diag_ned_error, axis=1)
+        diag_classical_error_3d = np.asarray(
+            [row["classical_posterior_error_3d_m"] for row in diag_rows],
+            dtype=float,
+        )
         diag_rmse_ned = np.sqrt(np.mean(diag_ned_error**2, axis=0))
         diag_rmse_3d = float(np.sqrt(np.mean(diag_error_3d**2)))
         diag_rmse = np.append(diag_rmse_ned, diag_rmse_3d)
+        data01_acceptance_gate = recursive_same_epoch_rmse_gate(
+            diag_error_3d,
+            diag_classical_error_3d,
+        )
         diag_time = np.asarray([row["time"] for row in diag_rows], dtype=float)
         diag_rho = np.asarray(
             [row["spectral_radius_knet"] for row in diag_rows], dtype=float
@@ -6468,6 +6591,10 @@ if __name__ == "__main__":
             "epochs": int(len(diag_rows)),
             "causal_warm_start": diag_warm_start,
             "rmse_n_e_d_3d_m": [float(x) for x in diag_rmse],
+            "recursive_same_epoch_acceptance_gate": data01_acceptance_gate,
+            "spectral_radius_status": (
+                "unavailable_Yan_Fig10_square_operator_not_published"
+            ),
             "first_spectral_radius_gt_1": _diag_first(diag_rho > 1.0),
             "first_error_gt_100m": _diag_first(diag_error_3d > 100.0),
             "first_error_gt_1km": _diag_first(diag_error_3d > 1_000.0),
@@ -6505,7 +6632,7 @@ if __name__ == "__main__":
                 int(diag_fde_stats["unresolved_epochs"]),
             ] if FDE_DIA_ON else None,
             "scope": (
-                "diagnostic_only_frozen_weights_same_Data01_recursive_online_rollout"
+                "frozen_weights_same_Data01_recursive_acceptance_before_Data02"
             ),
         }
 
@@ -6530,6 +6657,22 @@ if __name__ == "__main__":
             json.dumps(data01_recursive_summary, indent=2),
         )
         print("recursive Data01 CSV:", diag_csv_path)
+        if not data01_acceptance_gate["passed"]:
+            raise RuntimeError(
+                "Recursive Data01 acceptance gate rejected the checkpoint before "
+                "Data02: " + json.dumps(data01_acceptance_gate, sort_keys=True)
+            )
+        print(
+            "recursive Data01 acceptance gate: PASS -- learned/classical 3-D RMSE [m] =",
+            data01_acceptance_gate["learned_rmse_3d_m"],
+            "/",
+            data01_acceptance_gate["classical_rmse_3d_m"],
+        )
+    else:
+        raise RuntimeError(
+            "Independent Data02 testing requires the read-only recursive Data01 "
+            "same-epoch acceptance gate; set RUN_RECURSIVE_DATA01_DIAGNOSTIC=True"
+        )
 
     # =========================================================================
     # 9. LOAD AND SYNCHRONIZE THE INDEPENDENT TEST DATASET
@@ -6759,6 +6902,7 @@ if __name__ == "__main__":
     previous_online = None
     test_recurrent_capacity = int(nmax)
     test_warm_start = None
+    test_recurrent_state = None
     test_fde_stats = _new_fde_stats()
 
     last_gyro, last_accel = compensate_imu(
@@ -6907,8 +7051,11 @@ if __name__ == "__main__":
                 posterior_position = gnss_antenna_position(
                     nav, test_lever_arm_b_m
                 )
+                # No DIA or learned state correction is applied in this branch;
+                # P therefore remains the covariance paired with the reported
+                # INS-propagated state.
                 hpl_m, vpl_m = protection_levels_from_covariance(
-                    fde_result.dia_covariance, posterior_position
+                    P, posterior_position
                 )
                 online_rows.append({
                     "time": t,
@@ -7092,8 +7239,9 @@ if __name__ == "__main__":
                     dtype=torch.bool,
                     device=DEVICE,
                 ),
-                recurrent_state=None,
+                recurrent_state=test_recurrent_state,
             )
+            test_recurrent_state = output.recurrent_state
             innovation_tensor = torch.tensor(
                 innovation_nn[None],
                 dtype=torch.float32,
@@ -7148,8 +7296,8 @@ if __name__ == "__main__":
 
         # Detection/Identification used the untouched INS-predicted innovation.
         # Yan Eq. (34) has already been evaluated inside the classical DIA branch
-        # for integrity bookkeeping; the learned navigation update uses only the
-        # measurements left after fault elimination.
+        # as a diagnostic; the learned navigation update uses only the measurements
+        # left after fault elimination.
         P_prior_update = P.copy()
         Q_classical = (
             measurement_model.H @ P_prior_update @ measurement_model.H.T
@@ -7191,9 +7339,8 @@ if __name__ == "__main__":
         posterior_error_3d_m = float(
             np.linalg.norm(posterior_position - truth_position_now)
         )
-        pl_covariance = fde_result.dia_covariance if FDE_DIA_ON else P
         hpl_m, vpl_m = protection_levels_from_covariance(
-            pl_covariance, posterior_position
+            P, posterior_position
         )
         posterior_residual = build_innovation_only(
             nav, measurements, test_lever_arm_b_m
@@ -7334,6 +7481,9 @@ if __name__ == "__main__":
 
     divergence_diagnostics = {
         "eta_feedback_enabled": bool(ETA_FEEDBACK_ON),
+        "spectral_radius_status": (
+            "unavailable_Yan_Fig10_square_operator_not_published"
+        ),
         "first_spectral_radius_gt_1": _first_true_event(
             spectral_radius_knet > 1.0
         ),
@@ -7679,7 +7829,7 @@ if __name__ == "__main__":
                 ),
             },
             "MaskedCLA_Eq10_to_Eq29": (
-                "implemented_with_Fig8_pool_flatten_and_intra_epoch_masked_LSTM"
+                "implemented_with_Fig8_pool_flatten_masked_LSTM_and_cross_epoch_hc"
             ),
             "training_Eq30_to_Eq32": "Yan_state_MSE_plus_actual_Fig7_Fig8_closed_loop_forward_plus_Latent_KalmanNet_alternating",
             "Fig8_eta": {
@@ -7696,21 +7846,27 @@ if __name__ == "__main__":
                 "detection_identification": "Ref33_DIA",
                 "hard_exclusion_before_KNet": True,
                 "Eq34_DIA_state_covariance": "computed_for_identified_fault_mode",
+                "Eq34_applied_to_reported_navigation_state": False,
                 "old_nonpaper_post_exclusion_rejection_loop": False,
                 "alpha": FDE_SIGNIFICANCE_ALPHA,
             },
             "integrity": {
-                "HPL_VPL": (
-                    "computed_from_DIA_parameter_estimation_covariance_in_NED"
-                    if FDE_DIA_ON else "computed_from_learned_update_covariance_in_NED"
-                ),
+                "HPL_VPL": "computed_from_covariance_paired_with_reported_navigation_state_in_NED",
+                "Eq34_DIA_covariance_used_for_PL": False,
                 "horizontal_major_axis_evaluation": "Ref35_equation_overflow_safe_hypot_algebra",
                 "nonfinite_covariance_policy": "report_infinite_PL_instead_of_runtime_overflow",
                 "stanford_data_csv": True,
                 "alert_limits": "not_invented_paper_does_not_publish_numeric_HAL_VAL",
             },
             "stability": {
-                "online_closed_loop_spectral_radius": True,
+                "online_closed_loop_spectral_radius": False,
+                "spectral_radius_status": (
+                    "unavailable_Yan_Fig10_square_operator_not_published;"
+                    "former_I_minus_KH_completion_removed"
+                ),
+                "recursive_Data01_gate_before_Data02": (
+                    "same_epoch_learned_3D_RMSE_not_worse_than_classical_TC_KF"
+                ),
                 "exact_75_25_stress_generator": "not_reconstructed_distribution_parameters_unpublished",
             },
         },
@@ -7719,11 +7875,11 @@ if __name__ == "__main__":
             "causal_boundary_timing_for_state_innovation_and_state_residual",
             "exact_CNN_tensorization_pooling_and_FC_dimensions",
             "Data01_only_feature_standardization_Yan_does_not_publish_input_scaling",
-            "full_INS_cross_fusion_BPTT_Yan_unpublished_navigation_state_detached_between_fusion_epochs",
+            "full_INS_navigation_gradient_Yan_unpublished_navigation_state_detached_while_LSTM_hc_BPTT_is_retained",
             "neutral_zero_KG_output_initialization_Yan_does_not_publish_FC_initialization",
             "eta_timing_and_supervision_Yan_unpublished_zero_initialized_eta_kept_neutral_without_fabricated_target",
             "consecutive_fusion_loss_batch_size_Yan_batching_unpublished",
-            "intra_epoch_LSTM_sequence_interpretation_of_Yan_masked_Xbar_k",
+            "intra_epoch_slot_sequence_with_final_hc_carried_between_Yan_Xbar_k_epochs",
             "LEO_variance_intentionally_kept_as_v6_instead_of_Yan_Eq4",
             "random_LEO_masking_angle_distribution_from_Ref43",
             "FDE_false_alarm_probability_and_exact_fault_mode_matrices",
@@ -7751,6 +7907,7 @@ if __name__ == "__main__":
             "samples": int(training_sample_count),
             "Nmax": int(nmax),
             "epochs": int(TRAINING_EPOCHS),
+            "recursive_Data01_acceptance_gate": data01_acceptance_gate,
             "gamma_l2_completion": float(GAMMA_L2),
             "feature_standardization": {
                 "enabled": bool(FEATURE_STANDARDIZATION_ON),
@@ -7773,6 +7930,9 @@ if __name__ == "__main__":
                 "navigation_propagation": "Eq8_compensation_plus_ECEF_INS_mechanization",
                 "linearized_Phi_H_training_surrogate": False,
                 "cross_fusion_navigation_gradient": "detached_unpublished_by_Yan",
+                "cross_fusion_neural_gradient": (
+                    "LSTM_h_c_BPTT_within_each_short_trajectory"
+                ),
                 "training_trajectory_length": int(TRAINING_TRAJECTORY_LENGTH),
                 "training_trajectory_count": int(trajectory_count),
                 "trajectory_batch_size": int(TRAJECTORY_BATCH_SIZE),
@@ -7788,7 +7948,8 @@ if __name__ == "__main__":
                     "completed_previous_fusion_context_as_in_online_Data02"
                 ),
                 "masked_CLA_recurrent_state": (
-                    "reset_each_fusion_epoch_intra_epoch_masked_sequence"
+                    "carried_across_fusion_epochs_within_each_short_trajectory_"
+                    "reset_only_at_independent_trajectory_boundary"
                 ),
                 "synthetic_prior_augmentation": False,
                 "Data02_used": False,
@@ -7824,7 +7985,7 @@ if __name__ == "__main__":
             "epochs": int(len(online_rows)),
             "causal_warm_start": test_warm_start,
             "neural_recurrent_state": (
-                "reset_each_online_fusion_epoch_intra_epoch_masked_sequence"
+                "carried_across_online_fusion_epochs_after_causal_warm_start"
             ),
             "rmse_ned3d_m": [float(v) for v in rmse],
             "eta_feedback_enabled": bool(ETA_FEEDBACK_ON),
@@ -7835,6 +7996,9 @@ if __name__ == "__main__":
                 if classical_baseline_rmse is not None else None
             ),
             "fde_stats": test_fde_stats,
+            "spectral_radius_status": (
+                "unavailable_Yan_Fig10_square_operator_not_published"
+            ),
             "spectral_radius_knet_median": (
                 float(np.median(finite_rho_knet)) if finite_rho_knet.size else None
             ),
@@ -7933,6 +8097,11 @@ if __name__ == "__main__":
                 f"{np.median(finite_rho_classical):.6g}"
                 if finite_rho_classical.size else "nan"
             ),
+        )
+    else:
+        print(
+            "spectral radius KNet/classical: unavailable -- Yan Fig. 10 does not "
+            "publish the square closed-loop operator; invalid I-KH completion removed"
         )
     print(
         "median HPL/VPL [m]:",
