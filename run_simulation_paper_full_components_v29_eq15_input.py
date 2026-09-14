@@ -4240,8 +4240,8 @@ if __name__ == "__main__":
     OUTPUT_DIR = _default_output_dir()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    MAX_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_FUSION_EPOCHS", 200)
-    MAX_TEST_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_TEST_FUSION_EPOCHS", 200)
+    MAX_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_FUSION_EPOCHS", 100)
+    MAX_TEST_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_TEST_FUSION_EPOCHS", 100)
 
     # Table III explicitly gives Adam, initial LR=0.01, Conv=24,
     # LSTM=64 x 5, and dropout=0.2. Fig. 15 displays learning curves extending
@@ -4258,7 +4258,7 @@ if __name__ == "__main__":
     # optimizer update inside a trajectory.  The default length 100 is a
     # KalmanNet-example-guided completion, not a Yan hyperparameter.
     TRAINING_TRAJECTORY_LENGTH = _env_int(
-        "MKNET_TRAINING_TRAJECTORY_LENGTH", 100
+        "MKNET_TRAINING_TRAJECTORY_LENGTH", 5
     )
     BATCH_SIZE = _env_int("MKNET_BATCH_SIZE", 16)  # number of short trajectories
     LEARNING_RATE = 0.01
