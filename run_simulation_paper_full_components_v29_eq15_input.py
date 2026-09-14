@@ -40,12 +40,16 @@ navigation loop shown by Yan et al. in Figs. 7-8:
 - Yan's Eqs. (10)-(21) are now followed literally at the neural input boundary.
   At fusion epoch k the network receives one Eq. (15) vector
   X_k=[Delta-alpha,Delta-omega,Delta-xhat,Delta-xtilde,Delta-y_{k-1},Delta-ytilde_k].
-  Only the two variable observation blocks are zero-padded to Nmax, giving one
-  X_bar[k] of length 36+2*Nmax in this pseudorange-only 15-state reproduction.
+  The two valid observation blocks are appended at their current length Nk,
+  followed by one zero suffix of length 2*(Nmax-Nk), giving one X_bar[k] of
+  length 36+2*Nmax in this pseudorange-only 15-state reproduction.
   The former N-by-38 satellite-token representation and replication of the 36
   fixed IMU/state features into every satellite slot have been removed. The CNN
-  acts on X_bar[k] once; Pooling/Flatten produce one vector for epoch k; the LSTM
-  recurrence and attention are temporal across fusion epochs, not across satellites.
+  acts on X_bar[k] once. Pooling/Flatten retain one 24-D CNN vector per Eq. (15)
+  feature position, and the Eq. (23) output mask explicitly gates every LSTM
+  update. Masked attention then weights only the valid current-epoch LSTM outputs
+  according to Eqs. (26)-(29). The final valid h/c is carried across fusion epochs;
+  satellite slots are not used as an alternative tokenization of the 36 fixed features.
 - Raw Data01 observations, truth, timestamps, masks, and simulated LEO pseudoranges
   are fixed.  Estimator-dependent Eqs. (10)-(13) are NOT frozen: during training
   they are rebuilt causally from the current learned navigation trajectory, so the
@@ -95,11 +99,11 @@ navigation loop shown by Yan et al. in Figs. 7-8:
   explicit iterative treatment remains unchanged for the simulated LEO path.
 
 This CNN/LSTM revision retains the Pooling and Flatten stages drawn explicitly in
-Yan Fig. 8. The mask controls valid positions inside each padded X_bar[k]. Because
-valid entries form a contiguous prefix, packed-sequence LSTM evaluation is used:
-valid positions update the recurrent state, padded suffix positions are skipped,
-and the resulting h/c is carried to the next fusion epoch in that trajectory, as
-described around Eqs. (24)-(25). The exact pooling operator remains unpublished;
+Yan Fig. 8. The mask controls valid positions inside each padded X_bar[k]. The
+LSTM evaluates the Eq. (15) feature positions in order and applies Eq. (25)
+directly: valid positions update h/c, while masked positions retain the preceding
+h/c without modification. The resulting final valid h/c is carried to the next
+fusion epoch in that trajectory. The exact pooling operator remains unpublished;
 the implemented same-length masked max-pool is labelled as a Fig.-8-guided
 completion.
 
@@ -3797,10 +3801,10 @@ class LEODownlinkSimulator:
 # =============================================================================
 # Paper-supported architecture:
 #   Yan Eqs. (10)-(15): one feature vector X_k per fusion epoch.
-#   Yan Eqs. (16)-(21): only the variable observation part is zero-padded to Nmax.
+#   Yan Eqs. (16)-(21): the variable observation part receives one zero suffix.
 #   Yan Eqs. (22)-(23): masked convolution + mask propagation.
 #   Yan Eqs. (24)-(25): recurrent LSTM state update.
-#   Yan Eqs. (26)-(29): masked temporal attention.
+#   Yan Eqs. (26)-(29): masked attention over valid sequence positions.
 #   Yan Fig. 8: zero padding/mask -> Masked CNN -> Pooling -> Flatten
 #               -> Masked LSTM-Attention -> Masked FC.
 #   Yan Table III: 24 Conv1D filters, stride 1, ReLU; 64 LSTM units,
@@ -3811,8 +3815,9 @@ class LEODownlinkSimulator:
 #   the network input at epoch k is
 #
 #     X_bar[k] = [ fixed_36,
-#                  residual_{k-1,1:Nmax},
-#                  innovation_{k,1:Nmax} ]
+#                  residual_{k-1,1:Nk},
+#                  innovation_{k,1:Nk},
+#                  zeros_{2*Nmax-2*Nk} ]
 #
 #   with shape [B, 36 + 2*Nmax]. The 36 fixed IMU/state features appear exactly
 #   once. They are never broadcast or repeated over satellite slots.
@@ -3826,14 +3831,16 @@ class LEODownlinkSimulator:
 #
 #   Fig. 8 shows Pooling -> Flatten but does not publish pooling type/kernel/stride.
 #   A mask-preserving same-length max-pool (kernel 3, stride 1) is retained as the
-#   declared figure-guided completion. Flatten then produces one vector per epoch.
-#   Consequently the 5-layer LSTM advances ONCE per fusion epoch. Its hidden/cell
-#   state is carried chronologically across fusion epochs. Attention is causal over
-#   the sequence of top-layer LSTM outputs accumulated so far in the current
-#   trajectory. No satellite index is treated as the LSTM time axis.
+#   declared figure-guided completion. Flatten retains a 24-D CNN vector at every
+#   Eq. (15) feature position. The 5-layer LSTM scans those positions under the
+#   propagated Eq. (23) mask: invalid positions retain h/c exactly as in Eq. (25).
+#   The final valid h/c is carried chronologically across fusion epochs. Attention
+#   operates on the current epoch's position-wise LSTM outputs and receives that
+#   same Eq. (23) mask, as required by Eqs. (26)-(29). No satellite-token broadcast
+#   or separate all-valid temporal mask is introduced.
 #
 # Output tensorization remains necessarily a completion because Yan does not print
-# the exact Masked-FC reshape. A single FC head maps the temporal attention context
+# the exact Masked-FC reshape. A single FC head maps the masked attention context
 # to the full [15,Nmax] KG matrix, then the current observation mask zeroes padded
 # columns. This is closer to Fig. 8 than the former shared per-satellite head.
 FIXED_FEATURE_DIM = 6 + 2 * INS_STATE_DIM   # 36
@@ -3854,16 +3861,14 @@ class MaskedCLAOutput:
     ------
     kalman_gain : [B, 15, Nmax]
     imu_error   : [B, 6]
-    attention   : [B, temporal_history_length]
-    recurrent_state : (h, c, temporal_history)
-        h,c: [layers,B,64]
-        temporal_history: [B,L,64]
+    attention   : [B, D], D = 36 + 2*Nmax
+    recurrent_state : (h, c), each [layers,B,64]
     """
 
     kalman_gain: torch.Tensor
     imu_error: torch.Tensor
     attention: torch.Tensor
-    recurrent_state: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+    recurrent_state: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 class MaskedConv1d(nn.Module):
@@ -3957,16 +3962,20 @@ class MaskedConv1d(nn.Module):
                 m.bool(), pooled, torch.zeros_like(pooled)
             )
 
-        # Fig. 8 Flatten: one fixed feature vector for ONE fusion epoch.
-        return feature_maps.flatten(start_dim=1)      # [B,24*D]
+        # Fig. 8 Flatten: flatten the CNN map dimension at each Eq. (15)
+        # position without collapsing the masked position axis. This preserves
+        # M_out[k,t] for the LSTM required by Yan Eqs. (23)-(25).
+        return feature_maps.transpose(1, 2)            # [B,D,24]
 
 
 class MaskedStackedLSTM(nn.Module):
-    """Yan Eqs. (24)-(25) with the temporal axis equal to fusion epoch k.
+    """Yan Eqs. (24)-(25) with explicit per-position mask gating.
 
-    Each call advances the recurrent network exactly once for the current epoch.
-    The caller carries h/c to the next fusion epoch. Satellite slots are never
-    interpreted as timesteps.
+    Each call scans the CNN features of one padded Eq. (15) vector. At position
+    t, a valid mask permits the stacked LSTM update; a zero mask retains the
+    preceding hidden and cell states exactly as prescribed by Eq. (25). The final
+    valid h/c is returned for fusion epoch k+1. This operates on Eq. (15) feature
+    positions, not on the former broadcast satellite-token representation.
     """
 
     def __init__(
@@ -3981,10 +3990,11 @@ class MaskedStackedLSTM(nn.Module):
             raise ValueError("input_size, hidden_size and num_layers must be positive")
         if not (0.0 <= dropout < 1.0):
             raise ValueError("dropout must be in [0,1)")
+        self.input_size = int(input_size)
         self.hidden_size = int(hidden_size)
         self.num_layers = int(num_layers)
         self.lstm = nn.LSTM(
-            input_size=int(input_size),
+            input_size=self.input_size,
             hidden_size=self.hidden_size,
             num_layers=self.num_layers,
             dropout=float(dropout) if self.num_layers > 1 else 0.0,
@@ -3993,12 +4003,24 @@ class MaskedStackedLSTM(nn.Module):
 
     def forward(
         self,
-        x_epoch: torch.Tensor,
+        x: torch.Tensor,
+        mask: torch.Tensor,
         recurrent_state: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        if x_epoch.ndim != 2:
-            raise ValueError("MaskedStackedLSTM expects one epoch vector [B,F]")
-        batch_size = x_epoch.shape[0]
+        if x.ndim != 3 or mask.ndim != 2:
+            raise ValueError("MaskedStackedLSTM expects x=[B,D,F] and mask=[B,D]")
+        if x.shape[:2] != mask.shape:
+            raise ValueError("MaskedStackedLSTM x/mask position shapes do not match")
+        if x.shape[2] != self.input_size:
+            raise ValueError(
+                f"MaskedStackedLSTM feature size must be {self.input_size}, "
+                f"got {x.shape[2]}"
+            )
+
+        batch_size, position_count = x.shape[:2]
+        if position_count <= 0:
+            raise ValueError("MaskedStackedLSTM requires at least one position")
+
         if recurrent_state is not None:
             if len(recurrent_state) != 2:
                 raise ValueError("LSTM recurrent_state must be (hidden, cell)")
@@ -4008,15 +4030,33 @@ class MaskedStackedLSTM(nn.Module):
                     raise ValueError(
                         f"recurrent {name} must have shape {expected}, got {tuple(state.shape)}"
                     )
-                if state.device != x_epoch.device or state.dtype != x_epoch.dtype:
+                if state.device != x.device or state.dtype != x.dtype:
                     raise ValueError(f"recurrent {name} must match input device/dtype")
 
-        out, next_state = self.lstm(x_epoch.unsqueeze(1), recurrent_state)
-        return out[:, 0, :], next_state                  # [B,64]
+            hidden, cell = recurrent_state
+        else:
+            state_shape = (self.num_layers, batch_size, self.hidden_size)
+            hidden = x.new_zeros(state_shape)
+            cell = x.new_zeros(state_shape)
+
+        valid = mask.bool()
+        position_outputs = []
+        for position in range(position_count):
+            _, (candidate_hidden, candidate_cell) = self.lstm(
+                x[:, position : position + 1, :],
+                (hidden, cell),
+            )
+            gate = valid[:, position].view(1, batch_size, 1)
+            hidden = torch.where(gate, candidate_hidden, hidden)
+            cell = torch.where(gate, candidate_cell, cell)
+            position_outputs.append(hidden[-1])
+
+        output = torch.stack(position_outputs, dim=1)     # [B,D,64]
+        return output, (hidden, cell)
 
 
 class MaskedAttention(nn.Module):
-    """Yan Eqs. (26)-(29): causal attention over fusion-epoch LSTM outputs."""
+    """Yan Eqs. (26)-(29): attention over valid current-epoch LSTM positions."""
 
     def __init__(self, hidden_size: int) -> None:
         super().__init__()
@@ -4031,7 +4071,7 @@ class MaskedAttention(nn.Module):
         mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if h.ndim != 3 or mask.ndim != 2 or h.shape[:2] != mask.shape:
-            raise ValueError("MaskedAttention expects h=[B,L,H], mask=[B,L]")
+            raise ValueError("MaskedAttention expects h=[B,D,H], mask=[B,D]")
         valid = mask.bool()
         score = self.v(torch.tanh(self.proj(h))).squeeze(-1)
         score = score.masked_fill(~valid, -torch.inf)
@@ -4051,14 +4091,15 @@ class MaskedCLA(nn.Module):
     """Masked CNN-LSTM-attention KG estimator with paper-faithful Eq. (15) input.
 
     The input representation is exactly one padded Eq. (15) vector per fusion
-    epoch. The LSTM/attention temporal axis is fusion time, not satellite index.
+    epoch. Its feature-position mask gates the LSTM, whose final h/c is carried
+    across fusion epochs. The same mask excludes padded LSTM positions from the
+    current epoch's attention scores.
     """
 
     def __init__(
         self,
         nmax: int,
         dropout: float = 0.2,
-        attention_history_limit: int | None = None,
     ) -> None:
         super().__init__()
         if nmax <= 0:
@@ -4068,11 +4109,6 @@ class MaskedCLA(nn.Module):
 
         self.nmax = int(nmax)
         self.dropout = float(dropout)
-        self.attention_history_limit = (
-            None if attention_history_limit is None else int(attention_history_limit)
-        )
-        if self.attention_history_limit is not None and self.attention_history_limit <= 0:
-            raise ValueError("attention_history_limit must be positive or None")
         self.eq15_padded_dim = FIXED_FEATURE_DIM + 2 * self.nmax
 
         self.conv = MaskedConv1d(
@@ -4081,7 +4117,7 @@ class MaskedCLA(nn.Module):
             pool_kernel_size=FIG8_POOL_KERNEL_SIZE,
         )
         self.lstm = MaskedStackedLSTM(
-            input_size=24 * self.eq15_padded_dim,
+            input_size=24,
             hidden_size=64,
             num_layers=5,
             dropout=self.dropout,
@@ -4108,7 +4144,7 @@ class MaskedCLA(nn.Module):
         observations: torch.Tensor,
         mask: torch.Tensor,
         channel_mask: torch.Tensor,
-        recurrent_state: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        recurrent_state: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> MaskedCLAOutput:
         if fixed.ndim != 2 or observations.ndim != 3:
             raise ValueError("fixed must be [B,36] and observations [B,Nmax,2]")
@@ -4131,51 +4167,78 @@ class MaskedCLA(nn.Module):
         if tuple(channel_mask.shape) != expected_obs:
             raise ValueError("channel_mask must have shape [B,Nmax,2]")
 
+        satellite_valid = mask.bool()
         channel_bool = channel_mask.bool()
+
+        # The Eq. (16) packing below relies on the established data contract:
+        # current satellites occupy a contiguous prefix and every current
+        # innovation in that prefix is valid. Reject a silently different
+        # ordering instead of constructing a scientifically ambiguous vector.
+        satellite_count = satellite_valid.sum(dim=1)
+        satellite_position = torch.arange(self.nmax, device=mask.device).unsqueeze(0)
+        expected_prefix = satellite_position < satellite_count.unsqueeze(1)
+        if not torch.equal(satellite_valid, expected_prefix):
+            raise ValueError("mask must contain a contiguous valid prefix for Eq. (16)")
+        if not torch.equal(channel_bool[:, :, 1], satellite_valid):
+            raise ValueError("innovation channel_mask must match mask for Eq. (16)")
+
         observations = observations * channel_bool.to(dtype=observations.dtype)
 
         # Yan Eq. (15) / pseudorange-only Eq. (16):
-        # [fixed_36, previous residual Nmax, current innovation Nmax].
-        x_bar = torch.cat(
-            (fixed, observations[:, :, 0], observations[:, :, 1]), dim=1
-        )
+        # [fixed_36, previous residual Nk, current innovation Nk,
+        #  one zero suffix of length 2*(Nmax-Nk)].
         fixed_valid = torch.ones(
             (batch_size, FIXED_FEATURE_DIM), dtype=torch.bool, device=fixed.device
         )
-        feature_mask = torch.cat(
-            (fixed_valid, channel_bool[:, :, 0], channel_bool[:, :, 1]), dim=1
-        )
+        packed_values = []
+        packed_masks = []
+        for batch_index in range(batch_size):
+            count = int(satellite_count[batch_index].item())
+            suffix_length = 2 * (self.nmax - count)
+            variable_values = torch.cat(
+                (
+                    observations[batch_index, :count, 0],
+                    observations[batch_index, :count, 1],
+                    observations.new_zeros(suffix_length),
+                ),
+                dim=0,
+            )
+            variable_mask = torch.cat(
+                (
+                    channel_bool[batch_index, :count, 0],
+                    channel_bool[batch_index, :count, 1],
+                    torch.zeros(
+                        suffix_length, dtype=torch.bool, device=channel_mask.device
+                    ),
+                ),
+                dim=0,
+            )
+            packed_values.append(
+                torch.cat((fixed[batch_index], variable_values), dim=0)
+            )
+            packed_masks.append(
+                torch.cat((fixed_valid[batch_index], variable_mask), dim=0)
+            )
+
+        x_bar = torch.stack(packed_values, dim=0)
+        feature_mask = torch.stack(packed_masks, dim=0)
         if x_bar.shape[1] != self.eq15_padded_dim:
             raise RuntimeError("Eq. (15)/(16) padded input dimension mismatch")
 
-        conv_flat = self.conv(x_bar, feature_mask)
+        conv_sequence = self.conv(x_bar, feature_mask)
 
         lstm_state = None
-        temporal_history = None
         if recurrent_state is not None:
-            if len(recurrent_state) != 3:
-                raise ValueError("recurrent_state must be (hidden, cell, temporal_history)")
-            lstm_state = (recurrent_state[0], recurrent_state[1])
-            temporal_history = recurrent_state[2]
-            if temporal_history.ndim != 3 or temporal_history.shape[0] != batch_size:
-                raise ValueError("temporal_history must have shape [B,L,64]")
+            if len(recurrent_state) != 2:
+                raise ValueError("recurrent_state must be (hidden, cell)")
+            lstm_state = recurrent_state
 
-        current_hidden, next_lstm_state = self.lstm(conv_flat, lstm_state)
-        current_hidden = current_hidden.unsqueeze(1)  # [B,1,64]
-        if temporal_history is None:
-            next_history = current_hidden
-        else:
-            next_history = torch.cat((temporal_history, current_hidden), dim=1)
-        if (
-            self.attention_history_limit is not None
-            and next_history.shape[1] > self.attention_history_limit
-        ):
-            next_history = next_history[:, -self.attention_history_limit :, :]
-
-        temporal_mask = torch.ones(
-            next_history.shape[:2], dtype=torch.bool, device=next_history.device
+        lstm_sequence, next_lstm_state = self.lstm(
+            conv_sequence,
+            feature_mask,
+            lstm_state,
         )
-        context, attention = self.attention(next_history, temporal_mask)
+        context, attention = self.attention(lstm_sequence, feature_mask)
 
         gain = self.gain_head(context).view(batch_size, INS_STATE_DIM, self.nmax)
         gain = gain * mask.bool().to(dtype=gain.dtype).unsqueeze(1)
@@ -4185,7 +4248,7 @@ class MaskedCLA(nn.Module):
             kalman_gain=gain,
             imu_error=imu_error,
             attention=attention,
-            recurrent_state=(next_lstm_state[0], next_lstm_state[1], next_history),
+            recurrent_state=next_lstm_state,
         )
 
 
@@ -4240,15 +4303,15 @@ if __name__ == "__main__":
     OUTPUT_DIR = _default_output_dir()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    MAX_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_FUSION_EPOCHS", 50)
-    MAX_TEST_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_TEST_FUSION_EPOCHS", 50)
+    MAX_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_FUSION_EPOCHS", None)
+    MAX_TEST_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_TEST_FUSION_EPOCHS", None)
 
     # Table III explicitly gives Adam, initial LR=0.01, Conv=24,
     # LSTM=64 x 5, and dropout=0.2. Fig. 15 displays learning curves extending
     # to roughly 500 training epochs, but the text does not publish an exact
     # stopping epoch. Therefore 500 is used only as a maximum figure-guided
     # training horizon.
-    TRAINING_EPOCHS = _env_int("MKNET_TRAINING_EPOCHS", 1)
+    TRAINING_EPOCHS = _env_int("MKNET_TRAINING_EPOCHS", 500)
     # Yan et al. do not publish the mini-batch size or a cross-fusion training
     # segmentation.  KalmanNet, however, trains recursive estimators on batches of
     # trajectories and its V2 example divides long trajectories into shorter ones
@@ -4258,7 +4321,7 @@ if __name__ == "__main__":
     # optimizer update inside a trajectory.  The default length 100 is a
     # KalmanNet-example-guided completion, not a Yan hyperparameter.
     TRAINING_TRAJECTORY_LENGTH = _env_int(
-        "MKNET_TRAINING_TRAJECTORY_LENGTH", 5
+        "MKNET_TRAINING_TRAJECTORY_LENGTH", 100
     )
     BATCH_SIZE = _env_int("MKNET_BATCH_SIZE", 16)  # number of short trajectories
     LEARNING_RATE = 0.01
@@ -4968,7 +5031,6 @@ if __name__ == "__main__":
     model = MaskedCLA(
         nmax=network_nmax,
         dropout=0.2,
-        attention_history_limit=TRAINING_TRAJECTORY_LENGTH,
     ).to(DEVICE)
     # Yan et al. do not publish the FC-head initialization.  A zero initial KG is
     # the neutral navigation action (no arbitrary random state injection) and lets
@@ -4982,13 +5044,14 @@ if __name__ == "__main__":
     print(
         "Masked CLA input/CNN:",
         "Yan Eq.(15)/(16) single X_bar[k] vector; fixed 36 features appear once; "
+        "valid residual/innovation blocks precede one zero suffix; "
         "Conv1D 24 filters, kernel width 3, stride 1; masked same-length pool + flatten",
     )
     print(
         "Masked LSTM/attention:",
-        "64 units x 5 layers, dropout=0.2; one recurrent step per fusion epoch; "
-        "causal temporal attention over fusion-epoch hidden outputs; "
-        f"history_limit={TRAINING_TRAJECTORY_LENGTH} to match the KalmanNet-V2 training window",
+        "64 units x 5 layers, dropout=0.2; Eq.(23) feature-position mask gates "
+        "every LSTM h/c update; final valid h/c is carried across fusion epochs; "
+        "the same mask excludes padded positions from current-epoch attention",
     )
     print(
         "LSTM cross-fusion h/c carry:",
@@ -6500,7 +6563,9 @@ if __name__ == "__main__":
                 key: value.detach().cpu().clone()
                 for key, value in model.state_dict().items()
             },
-            "checkpoint_schema": "full_15_state_gain_v29_eq15_input_kalmannet_external_bptt",
+            "checkpoint_schema": (
+                "full_15_state_gain_v29_eq15_masked_lstm_attention_external_bptt"
+            ),
             "nmax": int(network_nmax),
             "training_observed_nmax": int(nmax),
             "eq7_state_order": "[delta_p,delta_v,delta_theta,b_a,b_g]",
@@ -8339,7 +8404,8 @@ if __name__ == "__main__":
             "neutral_zero_KG_output_initialization_Yan_does_not_publish_FC_initialization",
             "eta_direct_target_Yan_unpublished_indirect_future_state_BPTT_used_without_fabricated_direct_loss",
             "consecutive_fusion_loss_batch_size_Yan_batching_unpublished",
-            "intra_epoch_slot_sequence_with_final_hc_carried_between_Yan_Xbar_k_epochs",
+            "intra_epoch_Eq15_feature_position_sequence_with_masked_hc_updates_"
+            "and_final_hc_carried_between_Yan_Xbar_k_epochs",
             "LEO_variance_intentionally_kept_as_v6_instead_of_Yan_Eq4",
             "random_LEO_masking_angle_distribution_from_Ref43",
             "FDE_false_alarm_probability_and_exact_fault_mode_matrices",
@@ -8411,12 +8477,14 @@ if __name__ == "__main__":
                     "completed_previous_fusion_context_as_in_online_Data02"
                 ),
                 "masked_CLA_recurrent_state": (
-                    "one_LSTM_step_per_fusion_epoch;h_c_and_causal_attention_history_"
-                    "carried_within_each_short_trajectory_and_reset_only_at_trajectory_boundary"
+                    "Eq23_mask_gates_each_Eq15_feature_position_LSTM_update;final_h_c_"
+                    "carried_within_each_short_trajectory_and_reset_only_at_trajectory_"
+                    "boundary;Eq27_mask_excludes_padded_current_epoch_attention_positions"
                 ),
                 "input_tensorization": (
-                    "Yan_Eq15_single_vector_per_epoch;fixed36_once;only_residual_and_"
-                    "innovation_blocks_zero_padded_to_fixed_Nmax;no_satellite_token_broadcast"
+                    "Yan_Eq15_single_vector_per_epoch;fixed36_once;valid_residual_then_"
+                    "innovation_blocks;single_Eq16_zero_suffix_to_fixed_Nmax;"
+                    "no_satellite_token_broadcast"
                 ),
                 "synthetic_prior_augmentation": False,
                 "Data02_used": False,
