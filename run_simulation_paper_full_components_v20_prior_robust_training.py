@@ -10,13 +10,13 @@ project substitutions are preserved exactly as requested:
 
 Published components retained/restored in this revision include:
 - 15-state ECEF INS error propagation and Eq. (8) IMU-compensation interface;
-- full 15-row classical and learned measurement corrections in the Eq. (7)
-  order [delta-p, delta-v, delta-theta, b_a, b_g]; the six bias-gain rows are
-  retained and zero-initialized, but no artificial direct bias target is invented;
+- the Eq. (7) 15-state order [delta-p, delta-v, delta-theta, b_a, b_g]; the
+  paper does not publish separate bias labels, so the treatment of rows 9:15 is
+  an explicit implementation completion rather than a paper-published target;
 - Yan Eqs. (1),(2),(5) LEO pseudorange geometry/atmosphere/light-time path;
-- the LEO stochastic variance is intentionally kept identical to v6 at the user's
-  request: ionosphere + troposphere + Ref. [35] Eq. (18) elevation-only MP/NLOS,
-  with URA/receiver-noise terms not added to this project branch;
+- Yan Eq. (3) requires URA, ionosphere, troposphere, MP/NLOS, and receiver-noise
+  variance terms, while Eq. (4) supplies the elevation/CN0 MP/NLOS law. Numeric
+  values not given by Yan must come from the cited models and be labelled;
 - Eqs. (10)-(21) fixed offline X/M/Y data, masked CNN/LSTM/attention
   Eqs. (22)-(29), Table III hyperparameters, Eq. (30)/(32) supervised training,
   and Ref. [15]-style alternating optimization;
@@ -41,29 +41,20 @@ alternating optimization:
   this changes neither the published feature definitions nor any navigation/FDE/
   state-update equation;
 - Yan's published fixed offline X/M/Y construction (Eqs. 18-20) remains the base
-  training dataset. Each padded X_bar[k] is processed as one masked sequence at
-  fusion epoch k: CNN -> pooling/flatten -> masked LSTM -> attention -> FC. The
-  LSTM recurrence therefore runs inside the padded sequence and is reset for the
-  next fusion epoch; no unpublished hidden/cell carry is introduced between
-  navigation epochs. The filter and representation blocks are optimized
-  alternately following the general training principle of Ref. [15].
-- To address the observed offline-training/recursive-inference mismatch without
-  reintroducing unstable full-trajectory BPTT, each clean Data01 sample is paired
-  during training with one small first-order prior-perturbed variant. The
-  perturbation is drawn only from centered Data01 state-error labels, propagated
-  to the current innovation with the sample Jacobian H, and applied consistently
-  to the current state target and the two lagged state-history feature blocks.
-  This is an explicit robustness completion inspired by KalmanNet-style recursive
-  filtering and Latent-KalmanNet noisy-prior training; it is not claimed by Yan.
-  Data02 is never used for this augmentation. No full-trajectory BPTT is used.
+  training dataset. Each padded X_bar[k] follows CNN -> pooling/flatten -> masked
+  LSTM -> attention -> FC. Equations (24)-(25) explicitly depend on h/c from
+  k-1; therefore the network implementation must preserve temporal recurrent
+  state across consecutive training/testing epochs and reset it only at dataset
+  boundaries. The exact mask-to-state tensorization is not published by Yan.
+- Prior-perturbed augmentation is retained only as an optional diagnostic. It is
+  not part of Yan's training protocol and is not a standard assumption required
+  to implement a missing equation, so the paper-aligned default keeps it off.
 
 This CNN/LSTM revision retains the Pooling and Flatten stages drawn explicitly in
-Yan Fig. 8. The mask controls valid positions inside each padded X_bar[k]. Because
-valid entries form a contiguous prefix, packed-sequence LSTM evaluation is used:
-valid positions update the recurrent state and padded suffix positions are skipped,
-which is the simple implementation of the behavior described around Eqs. (24)-(25).
-The exact pooling operator remains unpublished; the implemented same-length masked
-max-pool is labelled as a Fig.-8-guided completion.
+Yan Fig. 8. The mask controls valid positions inside each padded X_bar[k], while
+the LSTM equations retain temporal h/c from epoch k-1. The exact pooling operator
+and mask-to-LSTM tensorization remain unpublished; their implementations must be
+labelled as Fig.-8/Eq.-25-guided completions.
 
 The separate post-training recursive Data01 rollout remains diagnostic only and
 never updates a network parameter or feeds information into Data02.
@@ -270,16 +261,11 @@ RUN_CLASSICAL_TEST_BASELINE = False
 # numerical ablation; True is the corrected numerically conditioned run.
 FEATURE_STANDARDIZATION_ON = True
 
-# Training-robustness completion. Yan et al. publish fixed offline X/M/Y but do
-# not specify how training is made robust to recursive prior errors. The current
-# diagnostics show that clean offline Eq. (30) can fit well while online features
-# drift out of distribution. Following the noisy-prior principle used in related
-# KalmanNet work, pair every clean Data01 sample with one linearly prior-perturbed
-# variant during training. The perturbation uses Data01 labels only; Data02 is
-# never consulted. A conservative half-scale keeps the first-order H*delta-x
-# approximation local while still exposing the network to prior mismatch.
-PRIOR_ROBUST_TRAINING_ON = True
-PRIOR_PERTURBATION_SCALE = 0.5
+# Optional robustness experiment, not the paper-aligned path. Yan et al. do not
+# publish noisy-prior augmentation or a perturbation scale. Keep it disabled by
+# default; enable it only as a separately labelled ablation using Data01 alone.
+PRIOR_ROBUST_TRAINING_ON = False
+PRIOR_PERTURBATION_SCALE = 0.5  # optional ablation value; not paper-published
 
 # Runtime/accuracy trade-off controls.
 # The final scientific LEO mask remains exactly LEO_MIN_ELEVATION_DEG.  This guard is
@@ -551,7 +537,7 @@ def transform_lever_arm_vehicle_to_body(
 
 
 def saastamoinen_delay_m(height_m: float, elevation_rad: float) -> float:
-    """Standard Saastamoinen tropospheric delay used by the current GNSS path."""
+    """Standard-completion Saastamoinen delay; the paper gives no closed form."""
     if elevation_rad <= 0.0:
         return float("inf")
     h = max(-100.0, min(float(height_m), 10000.0))
@@ -576,7 +562,7 @@ def klobuchar_delay_m(
     alpha_s,
     beta_s,
 ) -> float:
-    """GPS ICD Klobuchar model; returns delay in metres."""
+    """GPS-ICD Klobuchar completion of the paper's stated ionosphere model [m]."""
     alpha = np.asarray(alpha_s, dtype=float).reshape(4)
     beta = np.asarray(beta_s, dtype=float).reshape(4)
     lat_sc = latitude_rad / math.pi
@@ -692,7 +678,7 @@ def imu_model_to_si(model: IMUNoiseModel) -> IMUNoiseModelSI:
 
 
 def read_imu_error_models(path: str | Path) -> dict[str, IMUNoiseModel]:
-    """Read SmartPNT IMUErrorModel.txt and return models by IMU type."""
+    """Read SmartPNT statistics; these do not replace the paper's Table-II BS/WH."""
     text = Path(path).read_text(encoding="utf-8", errors="replace")
     keys = (
         "ISDV_Pos", "ISDV_Vel", "ISDV_Att", "ISDV_AccelBias", "ISDV_GyrosBias",
@@ -723,7 +709,9 @@ def read_imu_error_models(path: str | Path) -> dict[str, IMUNoiseModel]:
 
 
 # =============================================================================
-# RINEX observation: one pseudorange signal per GPS/BDS satellite
+# RINEX observation: one pseudorange signal per GPS/BDS satellite.
+# The article does not publish a per-code priority; this deterministic ordering is
+# a dataset-compatible completion and intentionally does not ingest Doppler/PRR.
 # =============================================================================
 _FREQUENCY_HZ = {
     ("G", "1"): 1575.42e6,
@@ -930,7 +918,10 @@ class RINEXObservationFile:
                     if snr_index is not None and snr_index < len(fields):
                         raw_snr = fields[snr_index].ljust(16)[:14].strip()
                         if raw_snr:
-                            value = float(raw_snr.replace("D", "E"))
+                            try:
+                                value = float(raw_snr.replace("D", "E"))
+                            except ValueError:
+                                value = math.nan
                             cn0 = value if math.isfinite(value) else None
                     measurements.append(
                         SatelliteMeasurement(sat_id, constellation, signal, pseudorange, cn0)
@@ -985,7 +976,12 @@ class RINEXClock:
                 value_count = int(fields[8])
                 values = [float(x.replace("D", "E")) for x in fields[9:]]
                 while len(values) < value_count:
-                    values.extend(float(x.replace("D", "E")) for x in stream.readline().split())
+                    continuation = stream.readline()
+                    if not continuation:
+                        break
+                    values.extend(float(x.replace("D", "E")) for x in continuation.split())
+                if len(values) < value_count or not values:
+                    continue
                 t = calendar_to_gpst_seconds(year, month, day, hour, minute, second, self.time_scale)
                 records[sat_id][0].append(t)
                 records[sat_id][1].append(values[0])
@@ -1040,6 +1036,13 @@ def read_rinex_navigation_header(path: str | Path) -> dict[str, tuple[float, ...
 # SP3 precise orbit
 # =============================================================================
 class SP3Orbit:
+    """Precise GNSS orbit data with a standard-completion interpolation order.
+
+    The paper requires real ephemerides and interpolation but does not publish the
+    GNSS SP3 polynomial order; nine points are therefore an explicit implementation
+    choice rather than a paper parameter.
+    """
+
     def __init__(self, path: str | Path, interpolation_points: int = 9):
         self.path = Path(path)
         self.interpolation_points = interpolation_points
@@ -1256,7 +1259,7 @@ def _read_imr_layout(path: str | Path) -> tuple[Path, IMRHeader, np.dtype, int, 
 
 def _adjust_imr_tow(tow: np.ndarray, header: IMRHeader) -> np.ndarray:
     tow = np.asarray(tow, dtype=np.float64)
-    tow = np.where(tow > 604800.0, tow - 604800.0, tow)
+    tow = np.where(tow >= 604800.0, tow - 604800.0, tow)
     tow -= header.time_tag_bias_ms * 1e-3
     return tow
 
@@ -1288,8 +1291,12 @@ def read_imr(
 
     The binary layout, scaling equations, float precision, units, and sample order are
     unchanged.  For partial runs only records that can influence the requested fusion
-    epochs are converted to floating-point sensor values.
+    epochs are converted to floating-point sensor values. ``cpp_exact`` reproduces the
+    dataset's supplied ReadIMR.cpp decoder; ``header_flags`` follows the documented
+    delta-theta/delta-velocity flags.
     """
+    if scaling_mode not in {"cpp_exact", "header_flags"}:
+        raise ValueError("scaling_mode must be 'cpp_exact' or 'header_flags'")
     path, header, record_dtype, record_count, record_bytes = _read_imr_layout(path)
     start_record = int(start_record)
     if stop_record is None:
@@ -1569,7 +1576,12 @@ def attitude_error_state_target(prior_body_to_ecef: np.ndarray, truth_body_to_ec
 # TLE files
 # =============================================================================
 def read_tle_directory(path: str | Path, allow_non_tle_files: bool = True):
-    """Return validated (line1, line2) pairs from every file in the TLE folder."""
+    """Return all validated TLE epochs; this is a non-paper STK/HPOP substitute.
+
+    Multiple pairs for one NORAD ID are intentionally retained so the later SGP4
+    provider can select an epoch-compatible element set rather than duplicate a
+    physical satellite.
+    """
     pairs = []
     for source in sorted(Path(path).iterdir()):
         if not source.is_file():
@@ -1686,9 +1698,10 @@ def compensate_imu(
     """Paper Eq. (8) IMU error compensation.
 
     The final two optional arguments implement the residual measurement-error
-    terms epsilon_g and epsilon_a in Eq. (8).  In the Masked-CLA path they are
-    supplied by eta_k = [epsilon_g(3), epsilon_a(3)].  Passing None preserves the
-    ordinary bias-only compensation used by the reference/feature path.
+    terms epsilon_g and epsilon_a in Eq. (8). Fig. 8 identifies eta_k as the
+    inertial-measurement-error output, but does not publish its dimension or packing;
+    this project declares eta_k = [epsilon_g(3), epsilon_a(3)] as an implementation
+    completion. Passing None preserves the ordinary bias-only reference path.
     """
     epsilon_g = (
         np.zeros(3)
@@ -1997,10 +2010,13 @@ class GNSSPreprocessor:
                 1e-4,
                 10,
             )
-        except (KeyError, ValueError):
+        except (KeyError, ValueError, RuntimeError):
             return None
 
-        satellite_clock_bias_s = self._clock_bias(raw.sat_id, transmit_time)
+        try:
+            satellite_clock_bias_s = self._clock_bias(raw.sat_id, transmit_time)
+        except (KeyError, ValueError):
+            return None
         rho, los, satellite_position_rx = geometric_range(
             receiver_position_ecef_m, state_tx_position, transit_s
         )
@@ -2036,10 +2052,12 @@ class GNSSPreprocessor:
                 height_m = receiver_llh[2]
             troposphere = saastamoinen_delay_m(height_m, elevation)
 
-        # Use the same physically motivated pseudorange precision components
-        # referenced by Yan rather than a fixed 5 m covariance. GNSS observations
-        # are real; this sigma is used only for weighting/FDE covariance.
-        cn0_dbhz = float(raw.cn0_dbhz) if raw.cn0_dbhz is not None else 45.0
+        # Yan's C/N0-dependent model cannot be evaluated from a guessed constant.
+        # Reject a record without its real RINEX C/N0 instead of injecting an
+        # unpublished 45 dB-Hz fallback into weighting and learned features.
+        if raw.cn0_dbhz is None:
+            return None
+        cn0_dbhz = float(raw.cn0_dbhz)
         iono_reference_frequency_hz = (
             1575.42e6 if raw.constellation == "G" else 1561.098e6
         )
@@ -2051,9 +2069,11 @@ class GNSSPreprocessor:
         tropo_sigma = ref35_troposphere_sigma_m(elevation) if self.use_troposphere else 0.0
         mp_sigma = yan_goGPS_mp_nlos_sigma_m(elevation, cn0_dbhz)
         receiver_sigma = ref35_receiver_noise_sigma_m(cn0_dbhz)
+        # Eq. (3) defines URA for simulated LEO observations.  Real GNSS uses the
+        # supplied precise SP3/CLK products as deterministic inputs here, so the
+        # LEO-specific URA constant must not be reused in the GNSS covariance.
         sigma_code_m = math.sqrt(
-            LEO_URA_SIGMA_M**2 + iono_sigma**2 + tropo_sigma**2
-            + mp_sigma**2 + receiver_sigma**2
+            iono_sigma**2 + tropo_sigma**2 + mp_sigma**2 + receiver_sigma**2
         )
         return PseudorangeMeasurement(
             raw.sat_id, raw.constellation, float(raw.pseudorange_m),
@@ -2089,9 +2109,12 @@ class GNSSPreprocessor:
 # 15-state error dynamics / KF
 # =============================================================================
 def build_error_state_dynamics(nav: NavigationState, specific_force_body_mps2: Array) -> Array:
-    """Paper Eq. (6)/(7), with signs matched to this file's feedback convention.
+    """Standard-completion F for the paper's Eq. (6)/(7) state ordering.
 
-    ``inject_error_state`` applies attitude feedback with
+    The article delegates the full F definition to Ref. [38]. This implementation
+    uses the standard central-gravity plus centrifugal gradient and keeps the signs
+    matched to this file's feedback convention. ``inject_error_state`` applies
+    attitude feedback with
     ``ATTITUDE_FEEDBACK_SIGN = -1`` and adds the estimated accelerometer bias to
     the nominal bias state. Under that convention, the velocity-error coupling
     from attitude and accelerometer-bias errors has the signs used below.
@@ -2099,11 +2122,14 @@ def build_error_state_dynamics(nav: NavigationState, specific_force_body_mps2: A
     F = np.zeros((INS_STATE_DIM, INS_STATE_DIM))
     r_e = nav.position_ecef_m
     radius = float(np.linalg.norm(r_e))
-    gravity = _gravitation_j2_ecef(r_e)
     radial = r_e / radius
     C = nav.body_to_ecef_dcm
     F[0:3, 3:6] = np.eye(3)
-    F[3:6, 0:3] = -(2.0 / radius) * np.outer(gravity, radial)
+    F[3:6, 0:3] = (
+        EARTH_GRAVITATIONAL_PARAMETER_M3PS2 / radius**3
+        * (3.0 * np.outer(radial, radial) - np.eye(3))
+        - OMEGA_IE_SKEW @ OMEGA_IE_SKEW
+    )
     F[3:6, 3:6] = -2.0 * OMEGA_IE_SKEW
     F[3:6, 6:9] = _skew(C @ np.asarray(specific_force_body_mps2))
     F[3:6, ACCELEROMETER_BIAS_STATE_SLICE] = -C
@@ -2113,6 +2139,7 @@ def build_error_state_dynamics(nav: NavigationState, specific_force_body_mps2: A
 
 
 def initial_covariance_from_imu_model(model: IMUNoiseModelSI) -> Array:
+    """Dataset-supplied P0 completion; Table II does not define its 15-D mapping."""
     sigma = np.concatenate([
         model.isdv_pos_m,
         model.isdv_vel_mps,
@@ -2124,6 +2151,7 @@ def initial_covariance_from_imu_model(model: IMUNoiseModelSI) -> Array:
 
 
 def continuous_process_covariance_from_imu_model(model: IMUNoiseModelSI) -> Array:
+    """Dataset-supplied Qc completion; paper BS/WH lack a full bias-time model."""
     density = np.concatenate([
         model.pnsd_pos_m_sqrt_s,
         model.pnsd_vel_mps_sqrt_s,
@@ -2236,12 +2264,10 @@ def predict_pseudorange(
     geometric_range = float(np.linalg.norm(range_vector))
     los = range_vector / geometric_range
 
-    # Current project: LEO receiver clock is ideal zero. GPS/BDS clocks are
-    # epoch-wise nuisance parameters eliminated from the measurement equations.
-    receiver_clock_m = (
-        0.0
-        if measurement.constellation == "L"
-        else float(receiver_clock_bias_m_by_system.get(measurement.constellation, 0.0))
+    # The 15-state layout contains no receiver clock. Use one epoch-wise nuisance
+    # per signal system, including LEO as required by c*delta_t_u in paper Eq. (1).
+    receiver_clock_m = float(
+        receiver_clock_bias_m_by_system.get(measurement.constellation, 0.0)
     )
 
     predicted = (
@@ -2255,23 +2281,22 @@ def predict_pseudorange(
 
 
 def retain_clock_observable_measurements(measurements) -> tuple[PseudorangeMeasurement, ...]:
-    """Drop a lone GPS/BDS pseudorange whose unknown receiver clock absorbs it fully.
+    """Drop a lone system pseudorange whose unknown receiver clock absorbs it fully.
 
-    One unknown receiver-clock nuisance is eliminated independently for GPS and
-    BDS at every epoch. A constellation represented by only one pseudorange has
-    zero position-information degrees of freedom after that elimination. LEO uses
-    the project's ideal-zero receiver clock and is therefore unaffected.
+    One receiver-clock nuisance is eliminated independently for GPS, BDS, and LEO
+    at every epoch. A system represented by only one pseudorange has zero position
+    information after that elimination.
     """
     measurements = tuple(measurements)
     counts = Counter(
         m.constellation
         for m in measurements
-        if m.constellation in {"G", "C"}
+        if m.constellation in {"G", "C", "L"}
     )
     return tuple(
         m
         for m in measurements
-        if m.constellation not in {"G", "C"} or counts[m.constellation] >= 2
+        if m.constellation not in {"G", "C", "L"} or counts[m.constellation] >= 2
     )
 
 
@@ -2280,10 +2305,10 @@ def estimate_receiver_clock_biases_wls_m(
     measurements,
     lever_arm_b_m: Array,
 ) -> dict[str, float]:
-    """Estimate one epoch-wise WLS receiver-clock nuisance for GPS and for BDS."""
+    """Estimate one epoch-wise WLS receiver-clock nuisance per signal system."""
     antenna = gnss_antenna_position(nav, lever_arm_b_m)
-    grouped = {"G": [], "C": []}
-    zero_clock = {"G": 0.0, "C": 0.0}
+    grouped = {"G": [], "C": [], "L": []}
+    zero_clock = {"G": 0.0, "C": 0.0, "L": 0.0}
     for m in measurements:
         if m.constellation not in grouped:
             continue
@@ -2312,7 +2337,7 @@ def _clock_projector_and_biases(
     n = len(measurements)
     projector = np.eye(n)
     receiver_clock: dict[str, float] = {}
-    for system in ("G", "C"):
+    for system in ("G", "C", "L"):
         index = np.asarray(
             [i for i, m in enumerate(measurements) if m.constellation == system],
             dtype=int,
@@ -2371,7 +2396,7 @@ def build_measurement_model(
     lever_skew = _skew(lever_e)
     sat_ids: list[str] = []
 
-    zero_clock = {"G": 0.0, "C": 0.0}
+    zero_clock = {"G": 0.0, "C": 0.0, "L": 0.0}
     for i, m in enumerate(measurements):
         y_pred_zero_clock[i], los = predict_pseudorange(
             antenna_position, m, zero_clock
@@ -2421,7 +2446,7 @@ def build_innovation_only(
         return np.empty(0)
 
     antenna_position = gnss_antenna_position(nav, lever_arm_b_m)
-    zero_clock = {"G": 0.0, "C": 0.0}
+    zero_clock = {"G": 0.0, "C": 0.0, "L": 0.0}
     raw_innovation = np.empty(n)
     variances = np.empty(n)
     for i, m in enumerate(measurements):
@@ -2473,9 +2498,9 @@ class Ref33FDEResult:
 def _ref33_psd_pinv_and_rank(matrix: Array) -> tuple[Array, int]:
     """Moore-Penrose inverse/rank in the effective residual subspace."""
     matrix = np.asarray(matrix, dtype=float)
-    matrix = 0.5 * (matrix + matrix.T)
     if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
         raise ValueError("Q_nu_nu must be square")
+    matrix = 0.5 * (matrix + matrix.T)
     if matrix.size == 0:
         return np.zeros_like(matrix), 0
     if not np.all(np.isfinite(matrix)):
@@ -2502,7 +2527,16 @@ def _ref33_detection_terms(
     measurement_model: TCMeasurementModel,
     alpha: float,
 ) -> tuple[float, float, int, Array, Array]:
-    """Ref. [33] global detection statistic on Yan's raw INS innovation."""
+    """Standard-completion of Yan Eq. (33) on the pre-KG INS innovation.
+
+    The article prints a scalar ``sigma^2 I`` term but does not publish sigma,
+    the false-alarm probability, or how receiver-clock nuisances are handled.
+    Here the already constructed heterogeneous measurement covariance ``R`` is
+    used, and the statistic is evaluated in the effective clock-projected
+    residual subspace using the Ref. [33] weighted-squared-norm definition.
+    This project retains pseudorange only; the pseudorange-rate part named by
+    Yan et al. remains an explicit project deviation.
+    """
     if not (0.0 < float(alpha) < 1.0):
         raise ValueError("FDE significance alpha must lie strictly between 0 and 1")
 
@@ -2510,7 +2544,8 @@ def _ref33_detection_terms(
     H = np.asarray(measurement_model.H, dtype=float)
     R = np.asarray(measurement_model.R, dtype=float)
     nu = np.asarray(measurement_model.innovation, dtype=float)
-    Q_nu_nu = 0.5 * ((H @ P @ H.T + R) + (H @ P @ H.T + R).T)
+    Q_nu_nu = H @ P @ H.T + R
+    Q_nu_nu = 0.5 * (Q_nu_nu + Q_nu_nu.T)
     Q_pinv, dof = _ref33_psd_pinv_and_rank(Q_nu_nu)
     if dof == 0:
         return 0.0, float("inf"), 0, Q_nu_nu, Q_pinv
@@ -2526,7 +2561,12 @@ def _ref33_identify_single_pseudorange_fault(
     measurement_model: TCMeasurementModel,
     Q_pinv: Array,
 ):
-    """Ref. [33] Eq. (7), q_i=1, one measurement-fault hypothesis per code."""
+    """Ref. [33] Eq. (7), q_i=1, one code-fault hypothesis per pseudorange.
+
+    Using projected unit directions is the standard completion required by this
+    file's epoch-wise receiver-clock elimination; Yan et al. do not specify this
+    interaction.
+    """
     nu = np.asarray(measurement_model.innovation, dtype=float)
     projector = np.asarray(measurement_model.clock_projector, dtype=float)
     qpinv_norm_2 = float(np.linalg.norm(Q_pinv, ord=2))
@@ -2589,10 +2629,11 @@ def _yan_eq34_dia_adaptation(
 ) -> tuple[Array, Array]:
     """Yan Eq. (34) with Ref. [33] Appendix Eq. (39).
 
-    This is evaluated inside the classical DIA inference branch, where the
-    orthogonality assumptions used by Ref. [33] hold. The resulting adapted
-    state/covariance are retained for integrity/PL bookkeeping; the proposed
-    Masked-CLA navigation update still uses the post-exclusion learned KG.
+    Ref. [33] provides the measurement-fault expression for ``L_i`` implemented
+    below. How this DIA state update is combined with Yan's post-exclusion
+    learned gain is not published. This project retains the adapted covariance
+    for integrity bookkeeping, while navigation uses the remaining measurements
+    with the learned KG; that combination is a declared standard completion.
     """
     Pm = np.asarray(prior_covariance, dtype=float)
     H = np.asarray(model.H, dtype=float)
@@ -2625,13 +2666,13 @@ def ref33_fde_dia_decision(
     lever_arm_b_m: Array,
     alpha: float,
 ) -> Ref33FDEResult:
-    """Yan Sec. II-D / Ref. [33] DIA on raw innovation before the learned KG.
+    """Yan Sec. II-D / Ref. [33] DIA on pre-KG INS innovation.
 
     A selected fault is eliminated and the Masked-CLA update proceeds on the
-    remaining measurements. The v6 post-exclusion global re-test that converted
-    many epochs into INS-only updates is removed because Yan does not publish
-    such a second rejection stage. If clock projection creates an exact tie, all
-    indistinguishable candidates are conservatively removed together.
+    remaining measurements. Yan does not publish a post-exclusion global re-test,
+    so none is applied. If clock projection creates an exact tie, all
+    indistinguishable candidates are removed together as a conservative standard
+    completion rather than silently selecting one satellite.
     """
     current = tuple(retain_clock_observable_measurements(measurements))
     tested_model = build_measurement_model(nav, current, lever_arm_b_m)
@@ -2703,6 +2744,8 @@ def ref33_fde_dia_decision(
 
 
 def _new_fde_stats() -> dict:
+    # The post-exclusion key is retained only for compatibility with existing
+    # result files; no unpublished second global test is evaluated.
     return {
         "epochs_checked": 0,
         "epochs_detected": 0,
@@ -2910,8 +2953,8 @@ def kalman_measurement_update(P: Array, innovation: Array, H: Array, R: Array):
     Yan et al. define innovation/residual/state-history features but do not publish
     the estimator used to generate those offline quantities. This conventional TC
     pass is therefore the feature-history completion and the independent classical
-    test baseline; it is not the proposed online Masked-CLA estimator. The GPS/BDS
-    clock projection makes S singular in removed clock directions, so a
+    test baseline; it is not the proposed online Masked-CLA estimator. The
+    GPS/BDS/LEO clock projection makes S singular in removed clock directions, so a
     Moore-Penrose inverse is used.
     """
     PHt = P @ H.T
@@ -3223,7 +3266,7 @@ def yan_goGPS_mp_nlos_sigma_m(elevation_rad: float, cn0_dbhz: float) -> float:
         variance = 1.0
     else:
         ratio = (cn0 - GOGPS_S1_DBHZ) / (GOGPS_S0_DBHZ - GOGPS_S1_DBHZ)
-        term = (
+        denominator = (
             10.0 ** (-(cn0 - GOGPS_S1_DBHZ) / GOGPS_A_DB)
             * (
                 (GOGPS_A / 10.0 ** (-(GOGPS_S0_DBHZ - GOGPS_S1_DBHZ) / GOGPS_A_DB) - 1.0)
@@ -3231,7 +3274,10 @@ def yan_goGPS_mp_nlos_sigma_m(elevation_rad: float, cn0_dbhz: float) -> float:
                 + 1.0
             )
         )
-        variance = (1.0 / max(math.sin(e) ** 2, 1e-6)) * term
+        # Paper Eq. (4) places sin(e)^2 in the numerator. This literal form is
+        # retained even though the cited goGPS expression is often presented as
+        # a weighting law rather than an error variance.
+        variance = math.sin(e) ** 2 / max(denominator, 1e-12)
     return float(math.sqrt(max(variance, 1e-12)))
 
 
@@ -3267,15 +3313,16 @@ def _unit_variance_student_t(rng: np.random.Generator, df: float = 3.0) -> float
 
 
 class LEODownlinkSimulator:
-    """Yan Eqs. (1),(2),(5) with TLE/SGP4 and the project's unchanged v6 variance.
+    """Yan Eqs. (1)-(5), using TLE/SGP4 as the declared orbit completion.
 
     The deterministic LEO geometry, light-time iteration, ionosphere-height
-    weighting, and troposphere model remain aligned with the paper. Per the
-    explicit project choice, the stochastic LEO variance is kept exactly as in
-    v6: ionosphere + troposphere + Ref.[35] Eq.(18) elevation-only MP/NLOS.
-    URA/receiver-noise variance and Yan Eq.(4)'s C/N0-dependent MP/NLOS term are
-    not substituted into this branch because doing so would change the requested
-    LEO variance.
+    weighting, and troposphere model follow the article. The covariance includes
+    every component printed in Eq. (3). Because the article does not publish its
+    deterministic LEO elevation-to-C/N0 curve or the exact thick-tail law, this
+    file uses the documented bounded C/N0 curve and a unit-variance Student-t(3)
+    draw for the published 25% severe-interference fraction. No LEO satellite
+    clock history is published, so its clock is the explicit ideal-zero completion;
+    the receiver clock remains an epoch-wise nuisance in the measurement model.
     """
     def __init__(
         self,
@@ -3400,11 +3447,11 @@ class LEODownlinkSimulator:
             else 0.0
         )
 
-        # Keep the LEO stochastic variance exactly as in the previous v6 code.
-        # Ionosphere/troposphere residual sigmas come from Ref. [35], while the
-        # combined MP/NLOS term uses the previous elevation-only Ref. [35] Eq. (18)
-        # model requested for this project. URA and receiver-noise variance are
-        # deliberately NOT added here, so the LEO covariance is not changed.
+        # Yan Eq. (3): URA + ionosphere + troposphere + MP/NLOS + receiver noise.
+        # The elevation-to-C/N0 relation itself is not published, so the bounded
+        # monotone design curve above is an explicit standard completion.
+        cn0_dbhz = leo_cn0_design_dbhz(elevation)
+        ura_sigma_m = LEO_URA_SIGMA_M
         iono_sigma_m = (
             ionosphere_path_scale
             * ref35_ionosphere_sigma_m(elevation, receiver_lat)
@@ -3416,40 +3463,33 @@ class LEODownlinkSimulator:
             if self.use_troposphere
             else 0.0
         )
-        mp_sigma_m = ref35_multipath_sigma_m(elevation)
-
-        # Same residual realization as v6: independent zero-mean Gaussian terms
-        # with component variances matching the covariance used in R.
-        ionosphere_residual_m = (
-            float(self.rng.normal(0.0, iono_sigma_m))
-            if iono_sigma_m > 0.0
-            else 0.0
-        )
-        troposphere_residual_m = (
-            float(self.rng.normal(0.0, tropo_sigma_m))
-            if tropo_sigma_m > 0.0
-            else 0.0
-        )
-        mp_nlos_error_m = (
-            float(self.rng.normal(0.0, mp_sigma_m))
-            if mp_sigma_m > 0.0
-            else 0.0
-        )
+        mp_sigma_m = yan_goGPS_mp_nlos_sigma_m(elevation, cn0_dbhz)
+        receiver_sigma_m = ref35_receiver_noise_sigma_m(cn0_dbhz)
 
         total_variance_m2 = (
-            iono_sigma_m**2
+            ura_sigma_m**2
+            + iono_sigma_m**2
             + tropo_sigma_m**2
             + mp_sigma_m**2
+            + receiver_sigma_m**2
         )
         sigma_code_m = math.sqrt(max(total_variance_m2, 1e-12))
+
+        # Yan Sec. II-E specifies a 75% normal / 25% severe-interference mixture
+        # but not its distribution. Student-t(3), normalized to unit variance,
+        # is the standard heavy-tail completion and keeps Eq. (3)'s variance.
+        standardized_error = (
+            _unit_variance_student_t(self.rng)
+            if self.rng.random() < 0.25
+            else float(self.rng.normal())
+        )
+        measurement_error_m = sigma_code_m * standardized_error
 
         pseudorange_m = (
             rho
             + ionosphere_m
             + troposphere_m
-            + ionosphere_residual_m
-            + troposphere_residual_m
-            + mp_nlos_error_m
+            + measurement_error_m
         )
         return PseudorangeMeasurement(
             sat_id,
@@ -3461,7 +3501,7 @@ class LEODownlinkSimulator:
             float(troposphere_m),
             float(sigma_code_m),
             float(elevation),
-            None,
+            float(cn0_dbhz),
         )
 
     def simulate_epoch(self, receive_time_gpst_s: float, receiver_position_ecef_m: Array):
@@ -3504,14 +3544,14 @@ class LEODownlinkSimulator:
 #   Table III: 24 Conv1D filters, stride 1, ReLU, 64 LSTM units, 5 layers,
 #              dropout 0.2.
 #
-# Conservative paper-aligned sequence interpretation used here:
+# Paper-aligned two-axis interpretation used here:
 #   - k indexes a fusion epoch/sample;
 #   - t indexes the zero-padded observation-sequence position within that epoch;
 #   - CNN/Pooling/Flatten are applied to each epoch independently;
-#   - the masked LSTM recurrence runs only over the valid t-prefix of X_bar[k];
-#   - Eq. (25)'s mask behavior is implemented by skipping the padded suffix;
-#   - hidden/cell state is local to one X_bar[k] call and is not carried between
-#     navigation fusion epochs or shared between Data01 and Data02.
+#   - the LSTM advances one temporal step from k-1 to k for every slot t;
+#   - Eq. (25) retains the previous hidden/cell state when M[k,t] is zero;
+#   - recurrent state is reset only at an independent-sequence boundary and is
+#     never shared between Data01 and Data02.
 #
 # Explicit project completions that remain because Yan et al. do not publish them:
 #   - one pseudorange-only satellite slot is represented by
@@ -3557,13 +3597,13 @@ class MaskedCLAOutput:
     kalman_gain : [B, 15, Nmax]
     imu_error   : [B, 6] -- eta_k = [epsilon_g(3) rad/s, epsilon_a(3) m/s^2]
     attention   : [B, Nmax]
-    recurrent_state : None (no cross-fusion hidden-state carry)
+    recurrent_state : tuple(h,c), each [layers,B,N,hidden]
     """
 
     kalman_gain: torch.Tensor
     imu_error: torch.Tensor
     attention: torch.Tensor
-    recurrent_state: None = None
+    recurrent_state: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 class MaskedConv1d(nn.Module):
@@ -3672,14 +3712,14 @@ class MaskedConv1d(nn.Module):
 
 
 class MaskedStackedLSTM(nn.Module):
-    """Yan Eqs. (24)-(25): masked LSTM over one padded fusion-epoch sequence.
+    """Yan Eqs. (24)-(25): one masked temporal LSTM step per fusion epoch.
 
-    Each call receives one or more padded X_bar[k] sequences with shape [B,N,C].
-    The valid mask is a contiguous prefix [1,...,1,0,...,0], as constructed by
-    Yan Eqs. (16)-(21). A standard stacked LSTM is therefore evaluated only over
-    the valid prefix using ``pack_padded_sequence``. The padded suffix never
-    updates h/c and its returned features are forced to zero. Hidden/cell state
-    is local to this call and is not carried to the next navigation fusion epoch.
+    Each call receives X_bar[k] with shape [B,N,C]. Slot ``t`` is treated as an
+    independent member of the recurrent batch while ``k`` is the LSTM time axis.
+    Thus the returned state carries each valid slot from k to k+1. For a padded
+    slot, Eq. (25) retains its previous h/c exactly. This also follows the original
+    KalmanNet practice of initializing recurrent state once per independent
+    sequence rather than once per measurement epoch.
     """
 
     def __init__(
@@ -3713,12 +3753,7 @@ class MaskedStackedLSTM(nn.Module):
         x: torch.Tensor,
         mask: torch.Tensor,
         recurrent_state: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, None]:
-        if recurrent_state is not None:
-            raise ValueError(
-                "cross-fusion recurrent_state is intentionally disabled; "
-                "each fusion epoch is one masked LSTM sequence"
-            )
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         if x.ndim != 3 or mask.ndim != 2:
             raise ValueError(
                 "MaskedStackedLSTM expects x=[B,N,C] and mask=[B,N]"
@@ -3733,32 +3768,41 @@ class MaskedStackedLSTM(nn.Module):
             raise ValueError("MaskedStackedLSTM requires a non-empty sequence")
 
         valid = mask.bool()
-        lengths = valid.sum(dim=1)
-        if torch.any(lengths <= 0):
-            raise ValueError("each MaskedStackedLSTM sample needs at least one valid slot")
-
-        # Yan's mask is a valid prefix followed by padding. Reject accidental holes.
-        positions = torch.arange(slot_count, device=mask.device).unsqueeze(0)
-        expected_prefix = positions < lengths.unsqueeze(1)
-        if not torch.equal(valid, expected_prefix):
-            raise ValueError(
-                "masked LSTM expects a contiguous valid prefix as in Yan Eq. (21)"
-            )
-
-        packed = nn.utils.rnn.pack_padded_sequence(
-            x,
-            lengths.detach().cpu(),
-            batch_first=True,
-            enforce_sorted=False,
+        expected_state_shape = (
+            self.num_layers,
+            batch_size,
+            slot_count,
+            self.hidden_size,
         )
-        packed_output, _ = self.lstm(packed)
-        output, _ = nn.utils.rnn.pad_packed_sequence(
-            packed_output,
-            batch_first=True,
-            total_length=slot_count,
+        if recurrent_state is None:
+            h_previous = x.new_zeros(expected_state_shape)
+            c_previous = x.new_zeros(expected_state_shape)
+        else:
+            h_previous, c_previous = recurrent_state
+            if (
+                tuple(h_previous.shape) != expected_state_shape
+                or tuple(c_previous.shape) != expected_state_shape
+            ):
+                raise ValueError(
+                    "recurrent_state shape does not match [layers,B,N,hidden]"
+                )
+
+        # One temporal step k for all satellite slots t in parallel.
+        recurrent_batch = batch_size * slot_count
+        x_step = x.reshape(recurrent_batch, 1, x.shape[-1])
+        h_flat = h_previous.reshape(self.num_layers, recurrent_batch, self.hidden_size)
+        c_flat = c_previous.reshape(self.num_layers, recurrent_batch, self.hidden_size)
+        _, (h_candidate, c_candidate) = self.lstm(x_step, (h_flat, c_flat))
+
+        gate = valid.reshape(1, recurrent_batch, 1)
+        h_next = torch.where(gate, h_candidate, h_flat)
+        c_next = torch.where(gate, c_candidate, c_flat)
+        output = h_next[-1].reshape(batch_size, slot_count, self.hidden_size)
+        next_state = (
+            h_next.reshape(expected_state_shape),
+            c_next.reshape(expected_state_shape),
         )
-        output = output * valid.unsqueeze(-1).to(dtype=output.dtype)
-        return output, None
+        return output, next_state
 
 
 class MaskedAttention(nn.Module):
@@ -3830,14 +3874,14 @@ class MaskedCLA(nn.Module):
             -> FC heads -> KG_k and eta_k.
 
     Each X_bar[k] is one padded observation sequence. The masked CNN processes
-    its valid slots, and the masked LSTM runs along those slots inside the same
-    fusion epoch. Hidden/cell state is reset for the next X_bar[k+1]; Yan et al.
-    do not publish a cross-fusion h/c carry, so none is introduced here.
+    its slots within epoch k; the masked LSTM then advances the state of every
+    slot from k-1 to k according to Eq. (25). State is reset at an independent
+    trajectory boundary, matching both the paper notation and KalmanNet practice.
 
     Yan's fixed offline labeled X/M/Y dataset of Eqs. (18)-(20) is the clean
     training base, while alternating optimization follows the general Ref. [15]
-    principle. A Data01-only first-order prior-perturbed view is paired with each
-    clean sample during optimization as an explicit robustness completion.
+    principle. The optional Data01-only first-order prior-perturbed view is a
+    separately labelled robustness ablation and is disabled in the paper path.
     Exact pooling hyperparameters, FC-head tensorization, eta_k supervision/timing
     and behavior when N_test>Nmax_train remain explicitly documented completions.
     """
@@ -3981,8 +4025,8 @@ class MaskedCLA(nn.Module):
         # Fig. 8: Masked CNN -> Pooling -> Flatten.
         conv_flat = self.conv(token, mask_values)
 
-        # Yan Eqs. (24)-(25): masked recurrent processing inside the current
-        # padded X_bar[k] sequence. No h/c is carried to the next fusion epoch.
+        # Yan Eqs. (24)-(25): advance one masked temporal step and return h/c for
+        # the next fusion epoch of the same independent trajectory.
         lstm, next_recurrent_state = self.lstm(
             conv_flat,
             mask_values,
@@ -4032,8 +4076,11 @@ def fig8_state_update(
     as an explicit operation prevents the training code from treating KG_k as a
     directly supervised label.
     """
-    if network_output.kalman_gain.ndim != 3:
-        raise ValueError("kalman_gain must have shape [B,state,N]")
+    if (
+        network_output.kalman_gain.ndim != 3
+        or network_output.kalman_gain.shape[1] != INS_STATE_DIM
+    ):
+        raise ValueError("kalman_gain must have shape [B,15,N]")
     if innovation.ndim != 2:
         raise ValueError("innovation must have shape [B,N]")
     if network_output.kalman_gain.shape[0] != innovation.shape[0]:
@@ -4097,7 +4144,10 @@ def fig8_post_update_error_state_9(
     direct accelerometer/gyro-bias truth, so no additional bias-label loss is
     fabricated.
     """
-    if estimated_error_state_15.ndim != 2:
+    if (
+        estimated_error_state_15.ndim != 2
+        or estimated_error_state_15.shape[1] != INS_STATE_DIM
+    ):
         raise ValueError("estimated_error_state_15 must have shape [B,15]")
     if true_error_state_9.ndim != 2 or true_error_state_9.shape[1] != 9:
         raise ValueError("true_error_state_9 must have shape [B,9]")
@@ -4127,18 +4177,26 @@ if __name__ == "__main__":
     OUTPUT_DIR = _default_output_dir()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    MAX_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_FUSION_EPOCHS", 100)
-    MAX_TEST_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_TEST_FUSION_EPOCHS", 100)
+    MAX_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_FUSION_EPOCHS", None)
+    MAX_TEST_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_TEST_FUSION_EPOCHS", None)
 
     # Table III explicitly gives Adam, initial LR=0.01, Conv=24,
     # LSTM=64 x 5, and dropout=0.2. Fig. 15 displays learning curves extending
     # to roughly 500 training epochs, but the text does not publish an exact
     # stopping epoch. Therefore 500 is used only as a maximum figure-guided
     # training horizon.
-    TRAINING_EPOCHS = _env_int("MKNET_TRAINING_EPOCHS", 30)
-    # Yan et al. do not publish a mini-batch size. BATCH_SIZE is therefore an
-    # explicit implementation completion used only for gradient accumulation.
-    # The masked LSTM sequence itself is the padded X_bar[k] inside each epoch.
+    TRAINING_EPOCHS = _env_int("MKNET_TRAINING_EPOCHS", 500)
+    # Yan et al. construct one ordered Data01 sequence over fusion epochs but do
+    # not publish how many epochs are unfolded per optimizer step. KalmanNet
+    # (2022) V2 explicitly proposes truncated BPTT by splitting a long trajectory
+    # into shorter trajectories and gives T=100 as its concrete example. Use that
+    # value only as a reference-guided, overridable implementation completion.
+    TBPTT_CHUNK_LENGTH_REQUESTED = _env_int("MKNET_TBPTT_CHUNK_LENGTH", 100)
+    # Yan et al. do not publish a mini-batch size. In the later training block,
+    # BATCH_SIZE therefore means the number of short trajectory chunks whose
+    # objectives are averaged before one optimizer step, following KalmanNet's
+    # trajectory mini-batch interpretation rather than treating satellite slots
+    # inside one X_bar[k] as independent training samples.
     BATCH_SIZE = _env_int("MKNET_BATCH_SIZE", 16)
     LEARNING_RATE = 0.01
     # Ref. [15] permits separate learning rates for its two alternating blocks,
@@ -4198,11 +4256,13 @@ if __name__ == "__main__":
     )
     print(
         "NN temporal training:",
-        f"Data01 X/M/Y base; intra-epoch masked LSTM; gradient batch={BATCH_SIZE}; "
-        "no cross-fusion h/c carry",
+        "KalmanNet V2-style truncated BPTT over ordered Data01 fusion epochs; "
+        f"requested chunk={TBPTT_CHUNK_LENGTH_REQUESTED}; "
+        f"requested trajectory batch={BATCH_SIZE}; "
+        "Masked-CLA h/c carries across epochs inside each trajectory chunk",
     )
     print(
-        "Prior-robust training:",
+        "Non-paper prior-perturbation ablation:",
         (
             "ON -- clean + one Data01-only first-order prior-perturbed variant "
             f"per sample (scale={PRIOR_PERTURBATION_SCALE:g})"
