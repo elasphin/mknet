@@ -3739,15 +3739,15 @@ if __name__ == "__main__":
     OUTPUT_DIR = _default_output_dir()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    MAX_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_FUSION_EPOCHS", None)
-    MAX_TEST_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_TEST_FUSION_EPOCHS", None)
+    MAX_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_FUSION_EPOCHS", 50)
+    MAX_TEST_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_TEST_FUSION_EPOCHS", 50)
 
     # Table III explicitly gives Adam, initial LR=0.01, Conv=24,
     # LSTM=64 x 5, and dropout=0.2. Fig. 15 displays learning curves extending
     # to roughly 500 training epochs, but the text does not publish an exact
     # stopping epoch. Therefore 500 is used only as a maximum figure-guided
     # training horizon.
-    TRAINING_EPOCHS = _env_int("MKNET_TRAINING_EPOCHS", 500)
+    TRAINING_EPOCHS = _env_int("MKNET_TRAINING_EPOCHS", 1)
 
     # KalmanNet (Revach et al., Sec. III-D) explicitly recommends:
     #   V2 short-trajectory truncated-BPTT warm-up -> V1 full-trajectory BPTT tuning.
@@ -3779,7 +3779,7 @@ if __name__ == "__main__":
     # KalmanNet V2 (Revach et al.): warm-up/training on short trajectories.
     # The KalmanNet paper gives T=100 as its explicit long-trajectory example.
     # Exact short-trajectory length is task dependent, so it remains configurable.
-    KNET_V2_TRAJECTORY_LENGTH = _env_int("MKNET_V2_TRAJECTORY_LENGTH", 100)
+    KNET_V2_TRAJECTORY_LENGTH = _env_int("MKNET_V2_TRAJECTORY_LENGTH", 10)
     # The supplied official Lorenz decimation example uses n_batch=8.
     # Yan et al. do not publish a trajectory mini-batch size.
     KNET_V2_BATCH_SIZE = _env_int("MKNET_V2_BATCH_SIZE", 8)
