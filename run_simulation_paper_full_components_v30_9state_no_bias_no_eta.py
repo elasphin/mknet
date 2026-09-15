@@ -4085,7 +4085,7 @@ if __name__ == "__main__":
     # optimizer update inside a trajectory.  The default length 100 is a
     # KalmanNet-example-guided completion, not a Yan hyperparameter.
     TRAINING_TRAJECTORY_LENGTH = _env_int(
-        "MKNET_TRAINING_TRAJECTORY_LENGTH", 5
+        "MKNET_TRAINING_TRAJECTORY_LENGTH", 10
     )
     BATCH_SIZE = _env_int("MKNET_BATCH_SIZE", 16)  # number of short trajectories
     LEARNING_RATE = 0.01
