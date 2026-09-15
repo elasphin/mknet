@@ -2401,11 +2401,11 @@ if __name__ == "__main__":
     OUTPUT_DIR = _default_output_dir()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    MAX_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_FUSION_EPOCHS", None)
-    MAX_TEST_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_TEST_FUSION_EPOCHS", None)
+    MAX_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_FUSION_EPOCHS", 50)
+    MAX_TEST_FUSION_EPOCHS = _env_optional_int("MKNET_MAX_TEST_FUSION_EPOCHS", 50)
 
     # Yan Table III: Adam, LR=0.01, Conv24, LSTM64x5, dropout0.2; 500 epochs is only a Fig.15-guided cap.
-    TRAINING_EPOCHS = _env_int("MKNET_TRAINING_EPOCHS", 500)
+    TRAINING_EPOCHS = _env_int("MKNET_TRAINING_EPOCHS", 1)
 
     # KalmanNet recommends V2 truncated-BPTT warm-up -> V1 full-trajectory tuning; phase lengths remain explicit.
     KNET_V2_WARMUP_EPOCHS = _env_int(
@@ -2427,7 +2427,7 @@ if __name__ == "__main__":
     REPRESENTATION_BLOCK_LEARNING_RATE = LEARNING_RATE
 
     # KalmanNet V2 uses short trajectories; T=100 is an example, so this length remains configurable.
-    KNET_V2_TRAJECTORY_LENGTH = _env_int("MKNET_V2_TRAJECTORY_LENGTH", 100)
+    KNET_V2_TRAJECTORY_LENGTH = _env_int("MKNET_V2_TRAJECTORY_LENGTH", 10)
     # The supplied official Lorenz decimation example uses n_batch=8.
     # Yan et al. do not publish a trajectory mini-batch size.
     KNET_V2_BATCH_SIZE = _env_int("MKNET_V2_BATCH_SIZE", 8)
