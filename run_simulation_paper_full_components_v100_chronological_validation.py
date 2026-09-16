@@ -51,8 +51,8 @@ ROVE_GROUND_TRUTH_PATH = TRAIN_DATASET_DIR / "ROVE_GroundTruth.txt"
 IMU_GROUND_TRUTH_PATH = TRAIN_DATASET_DIR / "ISA-100C_GroundTruth.txt"
 RINEX_OBS_PATH = TRAIN_DATASET_DIR / "ROVE.23O"
 IMR_PATH = TRAIN_DATASET_DIR / "ISA-100C.imr"
-SP3_PATH = KAGGLE_PROJECT_ROOT / "WUM0MGXFIN_20230020000_01D_05M_ORB.SP3"
-CLK_PATH = KAGGLE_PROJECT_ROOT / "WUM0MGXFIN_20230020000_01D_30S_CLK.CLK"
+SP3_PATH = TRAIN_DATASET_DIR / "WUM0MGXFIN_20230020000_01D_05M_ORB.SP3"
+CLK_PATH = TRAIN_DATASET_DIR / "WUM0MGXFIN_20230020000_01D_30S_CLK.CLK"
 NAV_PATH = TRAIN_DATASET_DIR / "brdm0020.23p"
 LEO_TLE_DIR = KAGGLE_PROJECT_ROOT / "LEO_TLE"
 def _env_optional_int(name: str, default: int | None) -> int | None:
@@ -2006,11 +2006,11 @@ if __name__ == '__main__':
     _run_wall_start = perf_counter()
     OUTPUT_DIR = _default_output_dir()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    MAX_FUSION_EPOCHS = _env_optional_int('MKNET_MAX_FUSION_EPOCHS', 50)
-    MAX_TEST_FUSION_EPOCHS = _env_optional_int('MKNET_MAX_TEST_FUSION_EPOCHS', 50)
+    MAX_FUSION_EPOCHS = _env_optional_int('MKNET_MAX_FUSION_EPOCHS', 1600)
+    MAX_TEST_FUSION_EPOCHS = _env_optional_int('MKNET_MAX_TEST_FUSION_EPOCHS', 600)
     TRAINING_EPOCHS = _env_int('MKNET_TRAINING_EPOCHS', 12)
-    KNET_V2_WARMUP_EPOCHS = _env_int('MKNET_V2_WARMUP_EPOCHS', 8)
-    KNET_V1_FINE_TUNE_EPOCHS = _env_nonnegative_int('MKNET_V1_FINE_TUNE_EPOCHS', 4)
+    KNET_V2_WARMUP_EPOCHS = _env_int('MKNET_V2_WARMUP_EPOCHS', 12)
+    KNET_V1_FINE_TUNE_EPOCHS = _env_nonnegative_int('MKNET_V1_FINE_TUNE_EPOCHS', 5)
     if KNET_V2_WARMUP_EPOCHS <= 0:
         raise ValueError('MKNET_V2_WARMUP_EPOCHS must be positive')
     # Yan reports initial LR=0.01. Public Latent-KalmanNet and
@@ -2030,7 +2030,7 @@ if __name__ == '__main__':
     # clip the active block's global L2 gradient norm before optimizer.step().
     # Yan does not report gradient clipping; this project keeps clipping separate from the selectable learning rate.
     GRADIENT_CLIP_NORM = 1.0
-    KNET_V2_TRAJECTORY_LENGTH = _env_int('MKNET_V2_TRAJECTORY_LENGTH', 10)
+    KNET_V2_TRAJECTORY_LENGTH = _env_int('MKNET_V2_TRAJECTORY_LENGTH', 25)
     KNET_V2_BATCH_SIZE = _env_int('MKNET_V2_BATCH_SIZE', 8)
     # KalmanNet-family validation discipline: keep a chronological holdout
     # inside Data01 for model selection; Data02 remains untouched test data.
