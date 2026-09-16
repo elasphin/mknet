@@ -41,7 +41,7 @@ SPEED_OF_LIGHT_MPS = 299792458.0
 GPS_EPOCH = datetime(1980, 1, 6, tzinfo=timezone.utc)
 GPS_WEEK_S = 604800.0
 IN_KAGGLE = Path('/kaggle/input').is_dir() and Path('/kaggle/working').is_dir()
-KAGGLE_PROJECT_ROOT = Path(os.environ.get('MKNET_PROJECT_ROOT', '/kaggle/input/datasets/elasphin/mknet-project'))
+KAGGLE_PROJECT_ROOT = Path(os.environ.get('MKNET_PROJECT_ROOT', '/kaggle/input/datasets/dlrmrsj/mknet-project-d'))
 DATASET_ROOT = KAGGLE_PROJECT_ROOT
 TRAIN_DATASET_DIR = DATASET_ROOT / 'Data01_20230102_ISA-100C_Vehicle_Complex'
 TEST_DATASET_DIR: Path | None = DATASET_ROOT / 'Data02_20220309_ISA-100C_Vehicle_Complex'
