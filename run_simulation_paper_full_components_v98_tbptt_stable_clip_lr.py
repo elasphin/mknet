@@ -1918,9 +1918,9 @@ if __name__ == '__main__':
     _run_wall_start = perf_counter()
     OUTPUT_DIR = _default_output_dir()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    MAX_FUSION_EPOCHS = _env_optional_int('MKNET_MAX_FUSION_EPOCHS', None)
-    MAX_TEST_FUSION_EPOCHS = _env_optional_int('MKNET_MAX_TEST_FUSION_EPOCHS', None)
-    TRAINING_EPOCHS = _env_int('MKNET_TRAINING_EPOCHS', 500)
+    MAX_FUSION_EPOCHS = _env_optional_int('MKNET_MAX_FUSION_EPOCHS', 50)
+    MAX_TEST_FUSION_EPOCHS = _env_optional_int('MKNET_MAX_TEST_FUSION_EPOCHS', 50)
+    TRAINING_EPOCHS = _env_int('MKNET_TRAINING_EPOCHS', 10)
     KNET_V2_WARMUP_EPOCHS = _env_int('MKNET_V2_WARMUP_EPOCHS', TRAINING_EPOCHS)
     KNET_V1_FINE_TUNE_EPOCHS = _env_nonnegative_int('MKNET_V1_FINE_TUNE_EPOCHS', TRAINING_EPOCHS)
     if KNET_V2_WARMUP_EPOCHS <= 0:
@@ -1942,7 +1942,7 @@ if __name__ == '__main__':
     # clip the active block's global L2 gradient norm before optimizer.step().
     # Yan does not report gradient clipping, so LR remains the paper value 0.01.
     GRADIENT_CLIP_NORM = 1.0
-    KNET_V2_TRAJECTORY_LENGTH = _env_int('MKNET_V2_TRAJECTORY_LENGTH', 100)
+    KNET_V2_TRAJECTORY_LENGTH = _env_int('MKNET_V2_TRAJECTORY_LENGTH', 10)
     KNET_V2_BATCH_SIZE = _env_int('MKNET_V2_BATCH_SIZE', 8)
     GAMMA_L2 = 1e-06
     FDE_SIGNIFICANCE_ALPHA = 0.001
