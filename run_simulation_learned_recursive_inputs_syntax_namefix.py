@@ -1221,9 +1221,9 @@ def fig8_state_update(network_output: MaskedCLAOutput, innovation: torch.Tensor)
 if __name__ == '__main__':
     _run_wall_start = perf_counter()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    MAX_FUSION_EPOCHS = 1601
-    MAX_TEST_FUSION_EPOCHS = 300
-    TRAINING_EPOCHS = 300
+    MAX_FUSION_EPOCHS = 50
+    MAX_TEST_FUSION_EPOCHS = 50
+    TRAINING_EPOCHS = 5
     LEARNING_RATE = 0.01
     WEIGHT_DECAY = 0.01
     VALIDATION_FRACTION = 0.20
