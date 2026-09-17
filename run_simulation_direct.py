@@ -38,9 +38,8 @@ GPS_EPOCH = datetime(1980, 1, 6, tzinfo=timezone.utc)
 GPS_WEEK_S = 604800.0
 IN_KAGGLE = Path('/kaggle/input').is_dir() and Path('/kaggle/working').is_dir()
 KAGGLE_PROJECT_ROOT = Path('/kaggle/input/datasets/elasphin/mknet-project')
-DATASET_ROOT = KAGGLE_PROJECT_ROOT
-TRAIN_DATASET_DIR = DATASET_ROOT / 'Data01_20230102_ISA-100C_Vehicle_Complex'
-TEST_DATASET_DIR: Path | None = DATASET_ROOT / 'Data02_20220309_ISA-100C_Vehicle_Complex'
+TRAIN_DATASET_DIR = KAGGLE_PROJECT_ROOT / 'Data01_20230102_ISA-100C_Vehicle_Complex'
+TEST_DATASET_DIR: Path | None = KAGGLE_PROJECT_ROOT / 'Data02_20220309_ISA-100C_Vehicle_Complex'
 README_XML_PATH = TRAIN_DATASET_DIR / 'README.xml'
 IMU_ERROR_MODEL_PATH = KAGGLE_PROJECT_ROOT / 'IMUErrorModel.txt'
 ROVE_GROUND_TRUTH_PATH = TRAIN_DATASET_DIR / 'ROVE_GroundTruth.txt'
@@ -1579,8 +1578,8 @@ if __name__ == '__main__':
     _run_wall_start = perf_counter()
     OUTPUT_DIR = Path('/kaggle/working/direct_run') if IN_KAGGLE else Path('direct_run')
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    MAX_FUSION_EPOCHS = 1601
-    MAX_TEST_FUSION_EPOCHS = 300
+    MAX_FUSION_EPOCHS = 50
+    MAX_TEST_FUSION_EPOCHS = 50
     TRAINING_EPOCHS = 12
     KNET_V2_ALTERNATING_EPOCHS = TRAINING_EPOCHS
     KNET_V1_FINE_TUNE_EPOCHS = 3
