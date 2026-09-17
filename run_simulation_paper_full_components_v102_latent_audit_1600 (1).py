@@ -2017,8 +2017,8 @@ if __name__ == '__main__':
     # The lagged feature construction discards the first usable fusion row, so
     # a 1601-fusion-epoch cap typically yields 1600 neural samples; the
     # chronological 80/20 split then gives about 1280 train and 320 validation samples. Environment variables still override all values.
-    MAX_FUSION_EPOCHS = _env_optional_int('MKNET_MAX_FUSION_EPOCHS', 1601)
-    MAX_TEST_FUSION_EPOCHS = _env_optional_int('MKNET_MAX_TEST_FUSION_EPOCHS', 300)
+    MAX_FUSION_EPOCHS = _env_optional_int('MKNET_MAX_FUSION_EPOCHS', 50)
+    MAX_TEST_FUSION_EPOCHS = _env_optional_int('MKNET_MAX_TEST_FUSION_EPOCHS', 50)
 
     # MKNET_TRAINING_EPOCHS and MKNET_V2_WARMUP_EPOCHS are retained only as
     # backwards-compatible aliases for the new MKNET_V2_ALTERNATING_EPOCHS setting. This stage is NOT the encoder-only warm
