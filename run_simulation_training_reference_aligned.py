@@ -52,7 +52,7 @@ TEST_ROVE_GROUND_TRUTH_PATH = Path('/kaggle/input/datasets/elasphin/mknet-projec
 TEST_IMU_GROUND_TRUTH_PATH = Path('/kaggle/input/datasets/elasphin/mknet-project/Data02_20220309_ISA-100C_Vehicle_Complex/ISA-100C_GroundTruth.txt')
 TEST_RINEX_OBS_PATH = Path('/kaggle/input/datasets/elasphin/mknet-project/Data02_20220309_ISA-100C_Vehicle_Complex/ROVE.22O')
 TEST_IMR_PATH = Path('/kaggle/input/datasets/elasphin/mknet-project/Data02_20220309_ISA-100C_Vehicle_Complex/ISA-100C.imr')
-TEST_SP3_PATH = Path('/kaggle/input/datasets/elasphin/mknet-project/Data02_20220309_ISA-100C_Vehicle_Complex/WUM0MGXFIN_20220680000_01D_05M_ORB.SP3')
+TEST_SP3_PATH = Path('/kaggle/input/datasets/elasphin/mknet-project/Data02_20220309_ISA-100C_Vehicle_Complex/WUM0MGXFIN_20220680000_01D_15M_ORB.SP3')
 TEST_CLK_PATH = Path('/kaggle/input/datasets/elasphin/mknet-project/Data02_20220309_ISA-100C_Vehicle_Complex/WUM0MGXFIN_20220680000_01D_30S_CLK.CLK')
 TEST_NAV_PATH = Path('/kaggle/input/datasets/elasphin/mknet-project/Data02_20220309_ISA-100C_Vehicle_Complex/brdm0680.22p')
 
@@ -1205,9 +1205,9 @@ def fig8_state_update(network_output: MaskedCLAOutput, innovation: torch.Tensor)
 if __name__ == '__main__':
     _run_wall_start = perf_counter()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    MAX_FUSION_EPOCHS = 1601
-    MAX_TEST_FUSION_EPOCHS = 300
-    TRAINING_EPOCHS = 500
+    MAX_FUSION_EPOCHS = 50
+    MAX_TEST_FUSION_EPOCHS = 50
+    TRAINING_EPOCHS = 5
     LEARNING_RATE = 0.01
     WEIGHT_DECAY = 1e-4
     TEST_LEO_SEED = LEO_SEED + 1
