@@ -1208,17 +1208,17 @@ if __name__ == '__main__':
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     set_reproducibility_seed(REPRODUCIBILITY_SEED)
     print(f'Reproducibility seed: {REPRODUCIBILITY_SEED}')
-    MAX_FUSION_EPOCHS = 61
-    MAX_TEST_FUSION_EPOCHS = 61
+    MAX_FUSION_EPOCHS = 1001
+    MAX_TEST_FUSION_EPOCHS = 300
     # KalmanNet_TSP V2 training controls.  TRAINING_EPOCHS is used as the
     # repository's n_steps: one randomly sampled mini-batch and one optimizer
     # update per step.  V2 splits the long training trajectory into independent
     # short trajectories; BPTT is complete inside each short trajectory only.
-    TRAINING_EPOCHS = 3
-    V2_BPTT_LENGTH = 10
-    V2_BATCH_SIZE = 3
-    LEARNING_RATE = 0.01
-    WEIGHT_DECAY = 0.01
+    TRAINING_EPOCHS = 20
+    V2_BPTT_LENGTH = 50
+    V2_BATCH_SIZE = 5
+    LEARNING_RATE = 0.001
+    WEIGHT_DECAY = 0.001
     VALIDATION_FRACTION = 0.20
     TEST_LEO_SEED = LEO_SEED + 1
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
