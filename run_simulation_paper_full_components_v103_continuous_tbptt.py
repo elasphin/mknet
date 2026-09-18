@@ -2020,8 +2020,8 @@ if __name__ == '__main__':
     # The lagged feature construction discards the first usable fusion row, so
     # a 1601-fusion-epoch cap typically yields 1600 neural samples; the
     # chronological 80/20 split then gives about 1280 train and 320 validation samples. Environment variables still override all values.
-    MAX_FUSION_EPOCHS = _env_optional_int('MKNET_MAX_FUSION_EPOCHS', 1601)
-    MAX_TEST_FUSION_EPOCHS = _env_optional_int('MKNET_MAX_TEST_FUSION_EPOCHS', 300)
+    MAX_FUSION_EPOCHS = _env_optional_int('MKNET_MAX_FUSION_EPOCHS', 101)
+    MAX_TEST_FUSION_EPOCHS = _env_optional_int('MKNET_MAX_TEST_FUSION_EPOCHS', 101)
 
     # Training follows the common KalmanNet pattern: one initialization per
     # physical trajectory, recursive state propagation, validation-based model
@@ -2029,7 +2029,7 @@ if __name__ == '__main__':
     # Adam and an initial LR of 0.01; the public KalmanNet repositories commonly
     # use 1e-3.  This direct raw-pseudorange gain path was numerically unstable
     # at 1e-3, so 1e-4 is the conservative default and remains overridable.
-    TRAINING_EPOCHS = _env_int('MKNET_TRAINING_EPOCHS', 20)
+    TRAINING_EPOCHS = _env_int('MKNET_TRAINING_EPOCHS', 15)
     YAN_REPORTED_LEARNING_RATE = 0.01
     LEARNING_RATE = _env_positive_float('MKNET_LEARNING_RATE', 1e-4)
     FILTER_BLOCK_LEARNING_RATE = LEARNING_RATE
