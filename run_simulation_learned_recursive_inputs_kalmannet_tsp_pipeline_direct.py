@@ -1214,11 +1214,11 @@ if __name__ == '__main__':
     # repository's n_steps: one randomly sampled mini-batch and one optimizer
     # update per step.  V2 splits the long training trajectory into independent
     # short trajectories; BPTT is complete inside each short trajectory only.
-    TRAINING_EPOCHS = 50
-    V2_BPTT_LENGTH = 10
+    TRAINING_EPOCHS = 20
+    V2_BPTT_LENGTH = 5
     V2_BATCH_SIZE = 5
-    LEARNING_RATE = 0.001
-    WEIGHT_DECAY = 0.001
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-4
     VALIDATION_FRACTION = 0.20
     TEST_LEO_SEED = LEO_SEED + 1
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
