@@ -2025,17 +2025,17 @@ if __name__ == '__main__':
     # The lagged feature construction discards the first usable fusion row, so
     # a 1601-fusion-epoch cap typically yields 1600 neural samples; the
     # chronological 80/20 split then gives about 1280 train and 320 validation samples. Environment variables still override all values.
-    MAX_FUSION_EPOCHS = _env_optional_int('MKNET_MAX_FUSION_EPOCHS', 501)
+    MAX_FUSION_EPOCHS = _env_optional_int('MKNET_MAX_FUSION_EPOCHS', 101)
     MAX_TEST_FUSION_EPOCHS = _env_optional_int('MKNET_MAX_TEST_FUSION_EPOCHS', 101)
 
     # MKNET_TRAINING_EPOCHS and MKNET_V2_WARMUP_EPOCHS are retained only as
     # backwards-compatible aliases for the new MKNET_V2_ALTERNATING_EPOCHS setting. This stage is NOT the encoder-only warm
     # start of Latent-KalmanNet Algorithm 2; it is short-trajectory alternating
     # optimization of theta then psi using the final navigation loss.
-    TRAINING_EPOCHS = _env_int('MKNET_TRAINING_EPOCHS', 15)
+    TRAINING_EPOCHS = _env_int('MKNET_TRAINING_EPOCHS', 10)
     _LEGACY_V2_EPOCHS = _env_int('MKNET_V2_WARMUP_EPOCHS', TRAINING_EPOCHS)
     KNET_V2_ALTERNATING_EPOCHS = _env_int('MKNET_V2_ALTERNATING_EPOCHS', _LEGACY_V2_EPOCHS)
-    KNET_V1_FINE_TUNE_EPOCHS = _env_nonnegative_int('MKNET_V1_FINE_TUNE_EPOCHS', 5)
+    KNET_V1_FINE_TUNE_EPOCHS = _env_nonnegative_int('MKNET_V1_FINE_TUNE_EPOCHS', 3)
     if KNET_V2_ALTERNATING_EPOCHS <= 0:
         raise ValueError('MKNET_V2_ALTERNATING_EPOCHS must be positive')
     # Yan reports initial LR=0.01. Public Latent-KalmanNet and
@@ -2064,7 +2064,7 @@ if __name__ == '__main__':
     # SensorFusion's primary configuration uses train_seq_len=50.  The longer
     # exposure reduces the mismatch between truth-initialized short training
     # trajectories and the 200+ epoch recursive validation rollout.
-    KNET_V2_TRAJECTORY_LENGTH = _env_int('MKNET_V2_TRAJECTORY_LENGTH', 10)
+    KNET_V2_TRAJECTORY_LENGTH = _env_int('MKNET_V2_TRAJECTORY_LENGTH', 5)
     KNET_V2_BATCH_SIZE = _env_int('MKNET_V2_BATCH_SIZE', 5)
     # Full-scale Kaiming is unsafe for this direct linear K @ raw_pseudorange
     # path.  Keep the nonzero symmetry-breaking directions at a small scale.
