@@ -55,7 +55,7 @@ EARTH_GRAVITATIONAL_PARAMETER_M3PS2 = 398600441800000.0
 SPEED_OF_LIGHT_MPS = 299792458.0
 GPS_EPOCH = datetime(1980, 1, 6, tzinfo=timezone.utc)
 GPS_WEEK_S = 604800.0
-IMU_ERROR_MODEL_PATH = Path('/kaggle/input/datasets/elasphin/mknet-project/IMUErrorModel.txt')
+IMU_ERROR_MODEL_PATH = Path('/kaggle/input/datasets/dlrmrsj/mknet-project-d/IMUErrorModel.txt')
 IMR_PATH = Path('/kaggle/input/datasets/dlrmrsj/mknet-project-d/Data01_20230102_ISA-100C_Vehicle_Complex/ISA-100C.imr')
 IMU_GROUND_TRUTH_PATH = Path('/kaggle/input/datasets/dlrmrsj/mknet-project-d/Data01_20230102_ISA-100C_Vehicle_Complex/ISA-100C_GroundTruth.txt')
 ROVE_GROUND_TRUTH_PATH = Path('/kaggle/input/datasets/dlrmrsj/mknet-project-d/Data01_20230102_ISA-100C_Vehicle_Complex/ROVE_GroundTruth.txt')
