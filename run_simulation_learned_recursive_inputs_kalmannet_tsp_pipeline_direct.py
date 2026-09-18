@@ -1208,8 +1208,8 @@ if __name__ == '__main__':
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     set_reproducibility_seed(REPRODUCIBILITY_SEED)
     print(f'Reproducibility seed: {REPRODUCIBILITY_SEED}')
-    MAX_FUSION_EPOCHS = 500
-    MAX_TEST_FUSION_EPOCHS = 100
+    MAX_FUSION_EPOCHS = 501
+    MAX_TEST_FUSION_EPOCHS = 101
     # KalmanNet_TSP V2 training controls.  TRAINING_EPOCHS is used as the
     # repository's n_steps: one randomly sampled mini-batch and one optimizer
     # update per step.  V2 splits the long training trajectory into independent
