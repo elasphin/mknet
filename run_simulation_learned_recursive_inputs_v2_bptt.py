@@ -54,8 +54,8 @@ TEST_IMU_GROUND_TRUTH_PATH = Path('/kaggle/input/datasets/elasphin/mknet-project
 TEST_RINEX_OBS_PATH = Path('/kaggle/input/datasets/elasphin/mknet-project/Data02_20220309_ISA-100C_Vehicle_Complex/ROVE.22O')
 TEST_IMR_PATH = Path('/kaggle/input/datasets/elasphin/mknet-project/Data02_20220309_ISA-100C_Vehicle_Complex/ISA-100C.imr')
 TEST_DATASET_DIR = Path('/kaggle/input/datasets/elasphin/mknet-project/Data02_20220309_ISA-100C_Vehicle_Complex')
-TEST_SP3_FILENAME = 'WUM0MGXFIN_20220680000_01D_05M_ORB.SP3'
-TEST_CLK_FILENAME = 'WUM0MGXFIN_20220680000_01D_30S_CLK.CLK'
+TEST_SP3_FILENAME = Path('/kaggle/input/datasets/elasphin/mknet-project/Data02_20220309_ISA-100C_Vehicle_Complex/WUM0MGXFIN_20220680000_01D_05M_ORB.SP3')
+TEST_CLK_FILENAME = Path('/kaggle/input/datasets/elasphin/mknet-project/Data02_20220309_ISA-100C_Vehicle_Complex/WUM0MGXFIN_20220680000_01D_30S_CLK.CLK')
 
 # Precise orbit/clock files may be stored either at the project root (as in Data01)
 # or inside the Data02 directory. Resolve only these two known locations.
