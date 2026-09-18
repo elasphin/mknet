@@ -42,7 +42,7 @@ SPEED_OF_LIGHT_MPS = 299792458.0
 GPS_EPOCH = datetime(1980, 1, 6, tzinfo=timezone.utc)
 GPS_WEEK_S = 604800.0
 IN_KAGGLE = Path('/kaggle/input').is_dir() and Path('/kaggle/working').is_dir()
-KAGGLE_PROJECT_ROOT = Path(os.environ.get('MKNET_PROJECT_ROOT', '/kaggle/input/datasets/elasphin/mknet-project'))
+KAGGLE_PROJECT_ROOT = Path(os.environ.get('MKNET_PROJECT_ROOT', '/kaggle/input/datasets/dlrmrsj/mknet-project-d'))
 DATASET_ROOT = KAGGLE_PROJECT_ROOT
 TRAIN_DATASET_DIR = DATASET_ROOT / 'Data01_20230102_ISA-100C_Vehicle_Complex'
 TEST_DATASET_DIR: Path | None = DATASET_ROOT / 'Data02_20220309_ISA-100C_Vehicle_Complex'
@@ -52,8 +52,8 @@ ROVE_GROUND_TRUTH_PATH = TRAIN_DATASET_DIR / "ROVE_GroundTruth.txt"
 IMU_GROUND_TRUTH_PATH = TRAIN_DATASET_DIR / "ISA-100C_GroundTruth.txt"
 RINEX_OBS_PATH = TRAIN_DATASET_DIR / "ROVE.23O"
 IMR_PATH = TRAIN_DATASET_DIR / "ISA-100C.imr"
-SP3_PATH = KAGGLE_PROJECT_ROOT / "WUM0MGXFIN_20230020000_01D_05M_ORB.SP3"
-CLK_PATH = KAGGLE_PROJECT_ROOT / "WUM0MGXFIN_20230020000_01D_30S_CLK.CLK"
+SP3_PATH = TRAIN_DATASET_DIR / "WUM0MGXFIN_20230020000_01D_05M_ORB.SP3"
+CLK_PATH = TRAIN_DATASET_DIR / "WUM0MGXFIN_20230020000_01D_30S_CLK.CLK"
 NAV_PATH = TRAIN_DATASET_DIR / "brdm0020.23p"
 LEO_TLE_DIR = KAGGLE_PROJECT_ROOT / "LEO_TLE"
 def _env_optional_int(name: str, default: int | None) -> int | None:
@@ -2025,17 +2025,17 @@ if __name__ == '__main__':
     # The lagged feature construction discards the first usable fusion row, so
     # a 1601-fusion-epoch cap typically yields 1600 neural samples; the
     # chronological 80/20 split then gives about 1280 train and 320 validation samples. Environment variables still override all values.
-    MAX_FUSION_EPOCHS = _env_optional_int('MKNET_MAX_FUSION_EPOCHS', 1601)
-    MAX_TEST_FUSION_EPOCHS = _env_optional_int('MKNET_MAX_TEST_FUSION_EPOCHS', 300)
+    MAX_FUSION_EPOCHS = _env_optional_int('MKNET_MAX_FUSION_EPOCHS', 501)
+    MAX_TEST_FUSION_EPOCHS = _env_optional_int('MKNET_MAX_TEST_FUSION_EPOCHS', 101)
 
     # MKNET_TRAINING_EPOCHS and MKNET_V2_WARMUP_EPOCHS are retained only as
     # backwards-compatible aliases for the new MKNET_V2_ALTERNATING_EPOCHS setting. This stage is NOT the encoder-only warm
     # start of Latent-KalmanNet Algorithm 2; it is short-trajectory alternating
     # optimization of theta then psi using the final navigation loss.
-    TRAINING_EPOCHS = _env_int('MKNET_TRAINING_EPOCHS', 12)
+    TRAINING_EPOCHS = _env_int('MKNET_TRAINING_EPOCHS', 15)
     _LEGACY_V2_EPOCHS = _env_int('MKNET_V2_WARMUP_EPOCHS', TRAINING_EPOCHS)
     KNET_V2_ALTERNATING_EPOCHS = _env_int('MKNET_V2_ALTERNATING_EPOCHS', _LEGACY_V2_EPOCHS)
-    KNET_V1_FINE_TUNE_EPOCHS = _env_nonnegative_int('MKNET_V1_FINE_TUNE_EPOCHS', 3)
+    KNET_V1_FINE_TUNE_EPOCHS = _env_nonnegative_int('MKNET_V1_FINE_TUNE_EPOCHS', 5)
     if KNET_V2_ALTERNATING_EPOCHS <= 0:
         raise ValueError('MKNET_V2_ALTERNATING_EPOCHS must be positive')
     # Yan reports initial LR=0.01. Public Latent-KalmanNet and
@@ -2064,8 +2064,8 @@ if __name__ == '__main__':
     # SensorFusion's primary configuration uses train_seq_len=50.  The longer
     # exposure reduces the mismatch between truth-initialized short training
     # trajectories and the 200+ epoch recursive validation rollout.
-    KNET_V2_TRAJECTORY_LENGTH = _env_int('MKNET_V2_TRAJECTORY_LENGTH', 50)
-    KNET_V2_BATCH_SIZE = _env_int('MKNET_V2_BATCH_SIZE', 8)
+    KNET_V2_TRAJECTORY_LENGTH = _env_int('MKNET_V2_TRAJECTORY_LENGTH', 10)
+    KNET_V2_BATCH_SIZE = _env_int('MKNET_V2_BATCH_SIZE', 5)
     # Full-scale Kaiming is unsafe for this direct linear K @ raw_pseudorange
     # path.  Keep the nonzero symmetry-breaking directions at a small scale.
     GAIN_HEAD_INITIAL_SCALE = _env_positive_float('MKNET_GAIN_HEAD_INITIAL_SCALE', 1e-3)
