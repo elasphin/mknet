@@ -1414,9 +1414,9 @@ if __name__ == '__main__':
     # --- FIXED RUN CONFIGURATION ---
     OUTPUT_DIR = Path('/kaggle/working/direct_run')
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    MAX_FUSION_EPOCHS = 1601
-    MAX_TEST_FUSION_EPOCHS = 300
-    TRAINING_EPOCHS = 20
+    MAX_FUSION_EPOCHS = 50
+    MAX_TEST_FUSION_EPOCHS = 50
+    TRAINING_EPOCHS = 5
     LEARNING_RATE = 1e-4
     FILTER_BLOCK_LEARNING_RATE = 1e-4
     REPRESENTATION_BLOCK_LEARNING_RATE = 1e-4
