@@ -1516,13 +1516,13 @@ def state_update(network_output: CLAOutput, innovation: torch.Tensor) -> torch.T
 if __name__ == '__main__':
     OUTPUT_DIR = Path('/kaggle/working/direct_run')
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    MAX_FUSION_EPOCHS = 300
+    MAX_FUSION_EPOCHS = 500
     MAX_TEST_FUSION_EPOCHS = 100
-    TRAINING_EPOCHS = 1
+    TRAINING_EPOCHS = 30
     LEARNING_RATE = 1e-4
     OPTIMIZER_WINDOW_SIZE = 20
     GRADIENT_CLIP_NORM = 1.0
-    EARLY_STOPPING_PATIENCE = 3
+    EARLY_STOPPING_PATIENCE = 6
     VALIDATION_FRACTION = 0.20
     GAMMA_L2 = 1e-6
     SEED = 0
