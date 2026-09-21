@@ -8,6 +8,7 @@ from functools import lru_cache
 from pathlib import Path
 import json
 import math
+import os
 import re
 import struct
 import xml.etree.ElementTree as ET
@@ -36,7 +37,7 @@ SPEED_OF_LIGHT_MPS = 299792458.0
 GPS_EPOCH = datetime(1980, 1, 6, tzinfo=timezone.utc)
 GPS_WEEK_S = 604800.0
 GPS_UTC_LEAP_SECONDS = 18.0 
-KAGGLE_PROJECT_ROOT = Path('/kaggle/input/datasets/dlrmrsj/mknet-project-d')
+KAGGLE_PROJECT_ROOT = Path('/kaggle/input/datasets/elasphin/mknet-project')
 DATASET_ROOT = KAGGLE_PROJECT_ROOT
 TRAIN_DATASET_DIR = DATASET_ROOT / 'Data01_20230102_ISA-100C_Vehicle_Complex'
 TEST_DATASET_DIR: Path | None = DATASET_ROOT / 'Data02_20220309_ISA-100C_Vehicle_Complex'
@@ -46,8 +47,8 @@ ROVE_GROUND_TRUTH_PATH = TRAIN_DATASET_DIR / "ROVE_GroundTruth.txt"
 IMU_GROUND_TRUTH_PATH = TRAIN_DATASET_DIR / "ISA-100C_GroundTruth.txt"
 RINEX_OBS_PATH = TRAIN_DATASET_DIR / "ROVE.23O"
 IMR_PATH = TRAIN_DATASET_DIR / "ISA-100C.imr"
-SP3_PATH = TRAIN_DATASET_DIR / "WUM0MGXFIN_20230020000_01D_05M_ORB.SP3"
-CLK_PATH = TRAIN_DATASET_DIR / "WUM0MGXFIN_20230020000_01D_30S_CLK.CLK"
+SP3_PATH = KAGGLE_PROJECT_ROOT / "WUM0MGXFIN_20230020000_01D_05M_ORB.SP3"
+CLK_PATH = KAGGLE_PROJECT_ROOT / "WUM0MGXFIN_20230020000_01D_30S_CLK.CLK"
 NAV_PATH = TRAIN_DATASET_DIR / "brdm0020.23p"
 LEO_TLE_DIR = KAGGLE_PROJECT_ROOT / "LEO_TLE"
 MAX_TRUTH_INTERPOLATION_GAP_S = 2.0
@@ -1593,9 +1594,9 @@ if __name__ == '__main__':
         )
     OUTPUT_DIR = Path('/kaggle/working/direct_run')
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    MAX_FUSION_EPOCHS = 500
-    MAX_TEST_FUSION_EPOCHS = 50
-    TRAINING_EPOCHS = 50
+    MAX_FUSION_EPOCHS = 1601
+    MAX_TEST_FUSION_EPOCHS = 300
+    TRAINING_EPOCHS = 20
     LEARNING_RATE = 1e-4
     OPTIMIZER_WINDOW_SIZE = 4
     GRADIENT_CLIP_NORM = 1.0
@@ -1605,6 +1606,31 @@ if __name__ == '__main__':
     SEED = 0
     TEST_LEO_SEED = 1
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # Diagnostic A/B/C/D bias-gradient ablation.
+    # Default 'both' preserves the original 15-state feedback behavior.
+    # none       -> learned delta_ba=0, delta_bg=0
+    # accel_only -> learned delta_ba active, delta_bg=0
+    # gyro_only  -> learned delta_ba=0, delta_bg active
+    # both       -> learned delta_ba and delta_bg active
+    BIAS_ABLATION_MODE = os.environ.get('BIAS_ABLATION_MODE', 'both').strip().lower()
+    _BIAS_ABLATION_MASKS = {
+        'none':       [1.0] * 9 + [0.0] * 3 + [0.0] * 3,
+        'accel_only': [1.0] * 9 + [1.0] * 3 + [0.0] * 3,
+        'gyro_only':  [1.0] * 9 + [0.0] * 3 + [1.0] * 3,
+        'both':       [1.0] * 9 + [1.0] * 3 + [1.0] * 3,
+    }
+    if BIAS_ABLATION_MODE not in _BIAS_ABLATION_MASKS:
+        raise ValueError(
+            f'BIAS_ABLATION_MODE must be one of {tuple(_BIAS_ABLATION_MASKS)}, '
+            f'got {BIAS_ABLATION_MODE!r}'
+        )
+    BIAS_ABLATION_MASK_T = torch.tensor(
+        _BIAS_ABLATION_MASKS[BIAS_ABLATION_MODE],
+        dtype=torch.float64,
+        device=DEVICE,
+    )
+    print(f'Bias-gradient ablation mode: {BIAS_ABLATION_MODE}')
     rover_xml = next(item for item in ET.fromstring(README_XML_PATH.read_text(encoding='utf-8', errors='replace')).findall('ROVE') if (item.findtext('ID') or '').strip() == '01')
     rover_imu_type = (rover_xml.findtext('SINS_IMUType') or '').strip()
     rover_mounting_xyz_deg = np.fromstring(rover_xml.findtext('SINS_RotAngle_IMU') or '', sep=' ')
@@ -1808,6 +1834,89 @@ if __name__ == '__main__':
     filter_optimizer = torch.optim.Adam(filter_parameters, lr=LEARNING_RATE)
     representation_optimizer = torch.optim.Adam(representation_parameters, lr=LEARNING_RATE)
     all_network_parameters = representation_parameters + filter_parameters
+
+    # Diagnostics only; optimizer/loss/TBPTT/hyperparameters stay unchanged.
+    bias_gradient_diagnostics_path = (
+        OUTPUT_DIR / f'bias_gradient_diagnostics_{BIAS_ABLATION_MODE}.jsonl'
+    )
+    bias_gradient_diagnostics_path.write_text('', encoding='utf-8')
+
+    def _gradient_diagnostics():
+        nonfinite_parameters = []
+        finite_total_sq = 0.0
+
+        for name, parameter in model.named_parameters():
+            if parameter.grad is None:
+                continue
+            grad = parameter.grad.detach()
+            finite = torch.isfinite(grad)
+            if not bool(torch.all(finite).cpu()):
+                nonfinite_parameters.append({
+                    'name': name,
+                    'nonfinite_count': int((~finite).sum().cpu()),
+                    'element_count': int(grad.numel()),
+                })
+            else:
+                grad64 = grad.double()
+                finite_total_sq += float(torch.sum(grad64 * grad64).cpu())
+
+        group_stats = {}
+        weight_grad = model.gain_head.weight.grad
+        bias_grad = model.gain_head.bias.grad if model.gain_head.bias is not None else None
+        groups = {
+            'navigation_rows_0_8': (0, 9),
+            'accel_bias_rows_9_11': (9, 12),
+            'gyro_bias_rows_12_14': (12, 15),
+        }
+
+        if weight_grad is not None:
+            weight_rows = weight_grad.reshape(INS_STATE_DIM, network_nmax, -1)
+            bias_rows = (
+                None if bias_grad is None
+                else bias_grad.reshape(INS_STATE_DIM, network_nmax)
+            )
+            for label, (start_row, stop_row) in groups.items():
+                values = [weight_rows[start_row:stop_row].reshape(-1)]
+                if bias_rows is not None:
+                    values.append(bias_rows[start_row:stop_row].reshape(-1))
+                values = torch.cat(values).detach().double()
+                finite = torch.isfinite(values)
+                finite_values = values[finite]
+                group_stats[label] = {
+                    'l2_finite_part': (
+                        float(torch.linalg.vector_norm(finite_values).cpu())
+                        if finite_values.numel() else 0.0
+                    ),
+                    'max_abs_finite': (
+                        float(torch.max(torch.abs(finite_values)).cpu())
+                        if finite_values.numel() else 0.0
+                    ),
+                    'nonfinite_count': int((~finite).sum().cpu()),
+                    'element_count': int(values.numel()),
+                }
+        else:
+            for label in groups:
+                group_stats[label] = {
+                    'l2_finite_part': 0.0,
+                    'max_abs_finite': 0.0,
+                    'nonfinite_count': 0,
+                    'element_count': 0,
+                }
+
+        return {
+            'all_finite': len(nonfinite_parameters) == 0,
+            'finite_total_l2': (
+                math.sqrt(finite_total_sq)
+                if not nonfinite_parameters else None
+            ),
+            'nonfinite_parameters': nonfinite_parameters,
+            'gain_head_groups': group_stats,
+        }
+
+    def _write_gradient_diagnostic(record):
+        with bias_gradient_diagnostics_path.open('a', encoding='utf-8') as stream:
+            stream.write(json.dumps(record, allow_nan=False) + '\n')
+
     training_imr_gyro_t = torch.as_tensor(imr_angular_rate_body_radps, dtype=torch.float64, device=DEVICE)
     training_imr_accel_t = torch.as_tensor(imr_acceleration_body_mps2, dtype=torch.float64, device=DEVICE)
     lever_arm_train_t = torch.as_tensor(lever_arm_b_m, dtype=torch.float64, device=DEVICE).reshape(3)
@@ -1964,6 +2073,7 @@ if __name__ == '__main__':
                 recurrent_state = output.recurrent_state
                 correction = state_update(output, innovation_nn.float().unsqueeze(0))[0].double()
                 correction = correction.reshape(INS_STATE_DIM)
+                correction = correction * BIAS_ABLATION_MASK_T
 
                 # Predicted state in Yan Eq. (7) notation.  The closed-loop
                 # navigation-error mean is zero after feedback, but the IMU
@@ -2070,15 +2180,61 @@ if __name__ == '__main__':
                 initial_state=carried,
             )
             carried = metrics['rollout_state']
+            window_stop = min(
+                window_start + OPTIMIZER_WINDOW_SIZE,
+                training_sample_count,
+            )
+
+            # _rollout() has already called mean_loss.backward().
+            eq30_diag = _gradient_diagnostics()
+            _write_gradient_diagnostic({
+                'mode': BIAS_ABLATION_MODE,
+                'phase': phase,
+                'stage': 'after_eq30_backward',
+                'window_start': int(window_start),
+                'window_stop': int(window_stop),
+                'eq30': float(metrics['eq30']),
+                **eq30_diag,
+            })
+            if not eq30_diag['all_finite']:
+                bad = ', '.join(
+                    item['name'] for item in eq30_diag['nonfinite_parameters']
+                )
+                raise FloatingPointError(
+                    f'non-finite Eq.(30) gradient | '
+                    f'mode={BIAS_ABLATION_MODE} | phase={phase} | '
+                    f'window={window_start}:{window_stop} | parameters={bad}'
+                )
+
             regularization = GAMMA_L2 * sum(
                 torch.sum(p.double() * p.double()) for p in all_network_parameters
             )  # Yan Eq. (32)
             regularization.backward()
+
+            reg_diag = _gradient_diagnostics()
+            _write_gradient_diagnostic({
+                'mode': BIAS_ABLATION_MODE,
+                'phase': phase,
+                'stage': 'after_regularization_backward',
+                'window_start': int(window_start),
+                'window_stop': int(window_stop),
+                'eq30': float(metrics['eq30']),
+                'regularization': float(regularization.detach().cpu()),
+                **reg_diag,
+            })
+            if not reg_diag['all_finite']:
+                bad = ', '.join(
+                    item['name'] for item in reg_diag['nonfinite_parameters']
+                )
+                raise FloatingPointError(
+                    f'non-finite gradient after regularization | '
+                    f'mode={BIAS_ABLATION_MODE} | phase={phase} | '
+                    f'window={window_start}:{window_stop} | parameters={bad}'
+                )
+
             active_grads = [p for p in active_parameters if p.grad is not None]
             grad_sq = 0.0
             for parameter in active_grads:
-                if not bool(torch.all(torch.isfinite(parameter.grad)).detach().cpu()):
-                    raise FloatingPointError('non-finite gradient')
                 grad64 = parameter.grad.detach().double()
                 grad_sq += float(torch.sum(grad64 * grad64).cpu())
             grad_norm = math.sqrt(grad_sq)
