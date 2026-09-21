@@ -1593,11 +1593,11 @@ if __name__ == '__main__':
         )
     OUTPUT_DIR = Path('/kaggle/working/direct_run')
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    MAX_FUSION_EPOCHS = 50
+    MAX_FUSION_EPOCHS = 500
     MAX_TEST_FUSION_EPOCHS = 50
-    TRAINING_EPOCHS = 5
+    TRAINING_EPOCHS = 50
     LEARNING_RATE = 1e-4
-    OPTIMIZER_WINDOW_SIZE = 25
+    OPTIMIZER_WINDOW_SIZE = 4
     GRADIENT_CLIP_NORM = 1.0
     EARLY_STOPPING_PATIENCE = 6
     VALIDATION_FRACTION = 0.20
