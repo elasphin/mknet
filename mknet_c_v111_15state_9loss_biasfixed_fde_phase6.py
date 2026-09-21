@@ -1613,7 +1613,7 @@ if __name__ == '__main__':
     # accel_only -> learned delta_ba active, delta_bg=0
     # gyro_only  -> learned delta_ba=0, delta_bg active
     # both       -> learned delta_ba and delta_bg active
-    BIAS_ABLATION_MODE = os.environ.get('BIAS_ABLATION_MODE', 'both').strip().lower()
+    BIAS_ABLATION_MODE = os.environ.get('BIAS_ABLATION_MODE', 'none').strip().lower()
     _BIAS_ABLATION_MASKS = {
         'none':       [1.0] * 9 + [0.0] * 3 + [0.0] * 3,
         'accel_only': [1.0] * 9 + [1.0] * 3 + [0.0] * 3,
