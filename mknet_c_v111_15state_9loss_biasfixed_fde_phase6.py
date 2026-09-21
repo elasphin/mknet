@@ -1432,6 +1432,17 @@ class MaskedLSTM(nn.Module):
             dropout=float(dropout) if self.num_layers > 1 else 0.0,
             batch_first=True,
         )
+        # Stability initialization adapted from the reference KalmanNet GRU:
+        # input weights use Xavier, recurrent weights are orthogonal, and all
+        # recurrent biases start at zero.  This changes initialization only;
+        # the Yan CNN-LSTM-attention-gain architecture is unchanged.
+        for parameter_name, parameter in self.lstm.named_parameters():
+            if 'weight_ih' in parameter_name:
+                nn.init.xavier_uniform_(parameter)
+            elif 'weight_hh' in parameter_name:
+                nn.init.orthogonal_(parameter)
+            elif 'bias' in parameter_name:
+                nn.init.zeros_(parameter)
 
     def forward(
         self,
@@ -1586,6 +1597,52 @@ def state_update(network_output: CLAOutput, innovation: torch.Tensor) -> torch.T
     return torch.bmm(network_output.kalman_gain, innovation.unsqueeze(-1)).squeeze(-1)
 
 
+# Detach every tensor carried across a TBPTT boundary without changing its
+# forward value.  This mirrors the reference model's _detach() lifecycle for
+# the recurrent state and recursive filter history.
+def _detach_rollout_state(
+    nav_state: TorchNavState,
+    previous_context: dict,
+    feature_accel: torch.Tensor,
+    feature_gyro: torch.Tensor,
+    recurrent_state: tuple[torch.Tensor, torch.Tensor] | None,
+):
+    detached_nav = TorchNavState(*(value.detach() for value in nav_state))
+    detached_context = {
+        key: value.detach() if isinstance(value, torch.Tensor) else value
+        for key, value in previous_context.items()
+    }
+    detached_recurrent = (
+        None
+        if recurrent_state is None
+        else tuple(value.detach() for value in recurrent_state)
+    )
+    return (
+        detached_nav,
+        detached_context,
+        feature_accel.detach(),
+        feature_gyro.detach(),
+        detached_recurrent,
+    )
+
+
+# Compact failure-only tensor summary for forward divergence diagnostics.
+def _tensor_finite_stats(value: torch.Tensor) -> dict:
+    tensor = value.detach()
+    finite = torch.isfinite(tensor)
+    finite_values = tensor[finite]
+    return {
+        'shape': list(tensor.shape),
+        'element_count': int(tensor.numel()),
+        'nonfinite_count': int((~finite).sum().cpu()),
+        'max_abs_finite': (
+            float(torch.max(torch.abs(finite_values)).cpu())
+            if finite_values.numel()
+            else 0.0
+        ),
+    }
+
+
 # Pipeline
 if __name__ == '__main__':
     if FDE_DETECTOR is None or FDE_IDENTIFIER is None or FDE_EXCLUDER is None or DIA_ADAPTER is None:
@@ -1594,11 +1651,12 @@ if __name__ == '__main__':
         )
     OUTPUT_DIR = Path('/kaggle/working/direct_run')
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    MAX_FUSION_EPOCHS = 1000
-    MAX_TEST_FUSION_EPOCHS = 50
+    MAX_FUSION_EPOCHS = 1601
+    MAX_TEST_FUSION_EPOCHS = 300
     TRAINING_EPOCHS = 20
     LEARNING_RATE = 1e-4
     OPTIMIZER_WINDOW_SIZE = 4
+    TBPTT_DETACH_STEP = 2
     GRADIENT_CLIP_NORM = 1.0
     EARLY_STOPPING_PATIENCE = 6
     VALIDATION_FRACTION = 0.20
@@ -1613,7 +1671,7 @@ if __name__ == '__main__':
     # accel_only -> learned delta_ba active, delta_bg=0
     # gyro_only  -> learned delta_ba=0, delta_bg active
     # both       -> learned delta_ba and delta_bg active
-    BIAS_ABLATION_MODE = os.environ.get('BIAS_ABLATION_MODE', 'none').strip().lower()
+    BIAS_ABLATION_MODE = os.environ.get('BIAS_ABLATION_MODE', 'both').strip().lower()
     _BIAS_ABLATION_MASKS = {
         'none':       [1.0] * 9 + [0.0] * 3 + [0.0] * 3,
         'accel_only': [1.0] * 9 + [1.0] * 3 + [0.0] * 3,
@@ -1835,11 +1893,42 @@ if __name__ == '__main__':
     representation_optimizer = torch.optim.Adam(representation_parameters, lr=LEARNING_RATE)
     all_network_parameters = representation_parameters + filter_parameters
 
-    # Diagnostics only; optimizer/loss/TBPTT/hyperparameters stay unchanged.
+    # Diagnostics only; these checks do not clamp or alter the optimizer,
+    # loss, Kalman gain, innovation, correction, or navigation state.
     bias_gradient_diagnostics_path = (
         OUTPUT_DIR / f'bias_gradient_diagnostics_{BIAS_ABLATION_MODE}.jsonl'
     )
     bias_gradient_diagnostics_path.write_text('', encoding='utf-8')
+    forward_finite_diagnostics_path = (
+        OUTPUT_DIR / f'forward_finite_diagnostics_{BIAS_ABLATION_MODE}.jsonl'
+    )
+    forward_finite_diagnostics_path.write_text('', encoding='utf-8')
+
+    def _check_forward_finite(sample_index, phase, stage, **named_tensors):
+        failed_names = [
+            name
+            for name, value in named_tensors.items()
+            if not bool(torch.all(torch.isfinite(value)).detach().cpu())
+        ]
+        if not failed_names:
+            return
+        record = {
+            'sample_index': int(sample_index),
+            'phase': 'validation' if phase is None else str(phase),
+            'stage': str(stage),
+            'failed_tensors': failed_names,
+            'tensors': {
+                name: _tensor_finite_stats(value)
+                for name, value in named_tensors.items()
+            },
+        }
+        with forward_finite_diagnostics_path.open('a', encoding='utf-8') as stream:
+            stream.write(json.dumps(record, allow_nan=False) + '\n')
+        raise FloatingPointError(
+            f'non-finite forward tensor at sample {sample_index} | '
+            f'phase={record["phase"]} | stage={stage} | '
+            f'tensors={", ".join(failed_names)}'
+        )
 
     def _gradient_diagnostics():
         nonfinite_parameters = []
@@ -2049,6 +2138,17 @@ if __name__ == '__main__':
                 if row['preceding_interval_segments']:
                     nav_state, feature_gyro, feature_accel = _propagate(nav_state, row['preceding_interval_segments'], training=training)
 
+                _check_forward_finite(
+                    sample_index,
+                    phase,
+                    'predicted_state',
+                    position=nav_state.position_ecef_m,
+                    velocity=nav_state.velocity_ecef_mps,
+                    body_to_ecef_dcm=nav_state.body_to_ecef_dcm,
+                    accel_bias=nav_state.accel_bias_body_mps2,
+                    gyro_bias=nav_state.gyro_bias_body_radps,
+                )
+
                 fusion_index = int(row['fusion_index'])
                 measurements = tuple(clock_observable(row['fixed_measurements']))
                 variances = np.asarray([m.variance_m2 for m in measurements], dtype=float)
@@ -2062,6 +2162,12 @@ if __name__ == '__main__':
                     torch.as_tensor(_clock_projection(measurements, variances), dtype=torch.float64, device=DEVICE),
                 )
                 innovation_now, current_sat_ids = _torch_innovation(nav_state, prepared)
+                _check_forward_finite(
+                    sample_index,
+                    phase,
+                    'innovation',
+                    innovation=innovation_now,
+                )
                 fixed_nn, obs_nn, mask_nn, channel_nn, innovation_nn = _network_input(previous_context, current_sat_ids, innovation_now, feature_accel, feature_gyro)
                 output = model(
                     fixed_nn.float().unsqueeze(0),
@@ -2071,9 +2177,23 @@ if __name__ == '__main__':
                     recurrent_state=recurrent_state,
                 )
                 recurrent_state = output.recurrent_state
+                _check_forward_finite(
+                    sample_index,
+                    phase,
+                    'network_output',
+                    kalman_gain=output.kalman_gain,
+                    recurrent_hidden=recurrent_state[0],
+                    recurrent_cell=recurrent_state[1],
+                )
                 correction = state_update(output, innovation_nn.float().unsqueeze(0))[0].double()
                 correction = correction.reshape(INS_STATE_DIM)
                 correction = correction * BIAS_ABLATION_MASK_T
+                _check_forward_finite(
+                    sample_index,
+                    phase,
+                    'correction',
+                    correction=correction,
+                )
 
                 # Predicted state in Yan Eq. (7) notation.  The closed-loop
                 # navigation-error mean is zero after feedback, but the IMU
@@ -2115,6 +2235,17 @@ if __name__ == '__main__':
                 ))
 
                 posterior_residual, _ = _torch_innovation(nav_state, prepared)
+                _check_forward_finite(
+                    sample_index,
+                    phase,
+                    'posterior_state',
+                    position=nav_state.position_ecef_m,
+                    velocity=nav_state.velocity_ecef_mps,
+                    body_to_ecef_dcm=nav_state.body_to_ecef_dcm,
+                    accel_bias=nav_state.accel_bias_body_mps2,
+                    gyro_bias=nav_state.gyro_bias_body_radps,
+                    posterior_innovation=posterior_residual,
+                )
                 previous_context = {
                     'sat_ids': tuple(current_sat_ids),
                     'residual': posterior_residual,
@@ -2125,15 +2256,47 @@ if __name__ == '__main__':
                     'gyro': feature_gyro.reshape(3),
                 }
 
+                # Reference-style TBPTT(k=2,w=4): keep the numerical state
+                # continuous while cutting every carried autograd history after
+                # two fusion steps.  Validation remains an uninterrupted causal
+                # forward rollout because it has no backward graph.
+                if training and (sample_index - start_sample + 1) % TBPTT_DETACH_STEP == 0:
+                    (
+                        nav_state,
+                        previous_context,
+                        feature_accel,
+                        feature_gyro,
+                        recurrent_state,
+                    ) = _detach_rollout_state(
+                        nav_state,
+                        previous_context,
+                        feature_accel,
+                        feature_gyro,
+                        recurrent_state,
+                    )
+
         mean_loss = torch.stack(state_losses).mean()
         if training:
             mean_loss.backward()
+            (
+                detached_nav,
+                detached_context,
+                detached_feature_accel,
+                detached_feature_gyro,
+                detached_recurrent_state,
+            ) = _detach_rollout_state(
+                nav_state,
+                previous_context,
+                feature_accel,
+                feature_gyro,
+                recurrent_state,
+            )
             carried = {
-                'nav': TorchNavState(nav_state.position_ecef_m.detach(), nav_state.velocity_ecef_mps.detach(), nav_state.body_to_ecef_dcm.detach(), nav_state.accel_bias_body_mps2.detach(), nav_state.gyro_bias_body_radps.detach()),
-                'context': {key: value.detach() if isinstance(value, torch.Tensor) else value for key, value in previous_context.items()},
-                'feature_accel': feature_accel.detach(),
-                'feature_gyro': feature_gyro.detach(),
-                'recurrent_state': None if recurrent_state is None else tuple(value.detach() for value in recurrent_state),
+                'nav': detached_nav,
+                'context': detached_context,
+                'feature_accel': detached_feature_accel,
+                'feature_gyro': detached_feature_gyro,
+                'recurrent_state': detached_recurrent_state,
             }
         else:
             carried = None
@@ -2355,6 +2518,7 @@ if __name__ == '__main__':
         'validation_position_rmse_m': best_val_position_rmse_m,
         'learning_rate': LEARNING_RATE,
         'optimizer_window_size': OPTIMIZER_WINDOW_SIZE,
+        'tbptt_detach_step': TBPTT_DETACH_STEP,
         'gradient_clip_norm': GRADIENT_CLIP_NORM,
     }, OUTPUT_DIR / 'best_model.pt')
     (OUTPUT_DIR / 'history.json').write_text(json.dumps(training_history, indent=2), encoding='utf-8')
