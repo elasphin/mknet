@@ -566,6 +566,7 @@ class DIAAdapter:
     ) -> DIAAdaptationResult:
         P_minus = np.asarray(prior_covariance, dtype=float)
         H = np.asarray(measurement_model.H, dtype=float)
+        R = np.asarray(measurement_model.R, dtype=float)
         nu = np.asarray(measurement_model.innovation, dtype=float).reshape(-1)
         projector = np.asarray(measurement_model.clock_projector, dtype=float)
 
@@ -574,8 +575,16 @@ class DIAAdapter:
         n_state = int(P_minus.shape[0])
         if H.shape != (len(nu), n_state):
             raise ValueError("measurement Jacobian shape is inconsistent with state/innovation")
+        if R.shape != (len(nu), len(nu)):
+            raise ValueError("measurement covariance shape is inconsistent with innovation")
         if projector.shape != (len(nu), len(nu)):
             raise ValueError("clock_projector shape is inconsistent with innovation")
+
+        # A non-PSD prior is an upstream propagation/update defect and must not
+        # be hidden by the DIA update.  Symmetrization removes only round-off
+        # asymmetry; it does not clamp or alter any eigenvalue.
+        P_minus = _validate_symmetric_psd(P_minus, "Ref. [33] prior P_minus")
+        R = _validate_symmetric_psd(R, "Ref. [33] projected measurement R")
 
         zero_state = np.zeros(n_state, dtype=float)
         zero_covariance = np.zeros((n_state, n_state), dtype=float)
@@ -613,10 +622,16 @@ class DIAAdapter:
         K0 = P_minus @ H.T @ Q_pinv
         x0_plus = K0 @ nu
 
-        # Source-faithful covariance expression:
-        # P0+ = (I - P^- H^T Q^-1 H) P^- .
+        # Numerically stable Joseph realization of the Ref. [33] nominal KF
+        # covariance.  In exact arithmetic this is algebraically identical to
+        # P0+ = (I - P^- H^T Q^+ H) P^-; unlike the one-sided expression it
+        # remains PSD under the rank-deficient clock-projected Q used here.
         identity_state = np.eye(n_state, dtype=float)
-        P0_plus = (identity_state - K0 @ H) @ P_minus
+        update_matrix = identity_state - K0 @ H
+        P0_plus = (
+            update_matrix @ P_minus @ update_matrix.T
+            + K0 @ R @ K0.T
+        )
         P0_plus = _validate_symmetric_psd(P0_plus, "Ref. [33] nominal P0_plus")
 
         # Phase-3 hypothesis C_i = clock_projector @ e_i.
@@ -737,4 +752,3 @@ class FDEExcluder:
             retained_measurements=retained,
             observability_dropped_sat_ids=observability_dropped,
         )
-
