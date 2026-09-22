@@ -1728,10 +1728,10 @@ if __name__ == '__main__':
     # One-time evaluation entry point: never train or overwrite the registered
     # Kaggle checkpoint.  Override the input path when the model is attached as
     # a Kaggle Dataset/Model rather than retained in the current working run.
-    TEST_ONLY = True
+    TEST_ONLY = False
     CHECKPOINT_PATH = Path(os.environ.get(
         'MKNET_CHECKPOINT_PATH',
-        '/kaggle/working/direct_run/best_model.pt',
+        '/kaggle/working/direct_test/best_model.pt',
     ))
     OUTPUT_DIR = Path('/kaggle/working/direct_test')
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1744,7 +1744,7 @@ if __name__ == '__main__':
     GRADIENT_CLIP_NORM = 1.0
     EARLY_STOPPING_PATIENCE = 6
     VALIDATION_FRACTION = 0.20
-    GAMMA_L2 = 1e-6
+    GAMMA_L2 = 1e-5
     SEED = 0
     TEST_LEO_SEED = 1
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
