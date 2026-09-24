@@ -80,7 +80,7 @@ def resolve_run_profile(profile: str) -> dict[str, int | None]:
     normalized = str(profile).strip().lower()
     if normalized == 'smoke':
         return {
-            'max_train_fusion_epochs': 50,
+            'max_train_fusion_epochs': 100,
             'max_test_fusion_epochs': 50,
             'training_epochs': 5,
         }
@@ -1941,7 +1941,7 @@ if __name__ == '__main__':
     # Training below intentionally departs from the paper's alternating
     # optimization: all Masked-CLA parameters are optimized jointly with one
     # Adam optimizer, following the reference GitHub Stateful KalmanNet trainer.
-    PAPER_INITIAL_LEARNING_RATE = 1e-2
+    PAPER_INITIAL_LEARNING_RATE = 1e-5
     LEARNING_RATE = PAPER_INITIAL_LEARNING_RATE
     OPTIMIZER_WINDOW_SIZE = 4
     TBPTT_DETACH_STEP = 2
