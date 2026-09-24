@@ -136,7 +136,7 @@ def resolve_run_profile(profile: str) -> dict[str, int | None]:
     normalized = str(profile).strip().lower()
     if normalized == 'smoke':
         return {
-            'max_train_fusion_epochs': 50,
+            'max_train_fusion_epochs': 101,
             'max_test_fusion_epochs': 50,
             'training_epochs': 5,
         }
@@ -2180,7 +2180,7 @@ if __name__ == '__main__':
     # Yan et al. Table III / Fig. 15 select an initial learning rate of 0.01.
     # Algorithm 2 of Latent-KalmanNet permits separate rates for the learned
     # filter (theta) and representation (psi); both default to Yan's value.
-    PAPER_INITIAL_LEARNING_RATE = 1e-2
+    PAPER_INITIAL_LEARNING_RATE = 1e-4
     LEARNING_RATES = resolve_alternating_learning_rates(
         PAPER_INITIAL_LEARNING_RATE,
     )
