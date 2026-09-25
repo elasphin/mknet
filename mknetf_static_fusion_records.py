@@ -75,7 +75,7 @@ TRAINING_STRATEGY = (
     'v3_deterministic_phase_probes_explicit_learning_rates'
 )
 ALTERNATING_PHASE_ORDER = ('filter', 'representation')
-ALTERNATING_RECURRENT_DROPOUT = 0.0
+ALTERNATING_RECURRENT_DROPOUT = 0.2
 ALTERNATING_PARAMETER_PARTITION = {
     'representation': ('conv',),
     'filter': ('lstm', 'attention', 'gain_head'),
@@ -94,9 +94,9 @@ RUN_PROFILE = 'direct_1001_sweep'
 OUTPUT_DIR = Path('/kaggle/working/direct_test')
 CHECKPOINT_PATH = OUTPUT_DIR / 'best_model.pt'
 
-MAX_FUSION_EPOCHS = 101
+MAX_FUSION_EPOCHS = 1001
 MAX_TEST_FUSION_EPOCHS = 50
-TRAINING_EPOCHS = 5
+TRAINING_EPOCHS = 50
 TRAINING_SEQUENCE_LENGTH = 50
 REQUESTED_TRAIN_BATCH_SIZE = 20
 
