@@ -2384,10 +2384,10 @@ if __name__ == '__main__':
     ))
     if TRAINING_SEQUENCE_LENGTH <= 0:
         raise ValueError('MKNET_TRAINING_SEQUENCE_LENGTH must be positive')
-    OPTIMIZER_WINDOW_SIZE = 4
+    OPTIMIZER_WINDOW_SIZE = 10
     TBPTT_DETACH_STEP = 2
     GRADIENT_CLIP_NORM = 1.0
-    EARLY_STOPPING_PATIENCE = 6
+    EARLY_STOPPING_PATIENCE = 20
     VALIDATION_FRACTION = 0.20
     # Yan Eq. (32) publishes the L2 coefficient symbol gamma but does not give
     # its numerical value.  Retain the project's existing 1e-5 explicitly as
