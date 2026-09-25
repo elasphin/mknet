@@ -2392,7 +2392,7 @@ if __name__ == '__main__':
     # Yan Eq. (32) publishes the L2 coefficient symbol gamma but does not give
     # its numerical value.  Retain the project's existing 1e-5 explicitly as
     # an unpublished reproduction setting; do not label it paper-exact.
-    GAMMA_L2 = 1e-5
+    GAMMA_L2 = 1e-4
     SEED = 0
     TEST_LEO_SEED = 1
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
