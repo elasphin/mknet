@@ -211,7 +211,7 @@ def resolve_run_profile(profile: str) -> dict[str, int | None]:
     normalized = str(profile).strip().lower()
     if normalized == 'smoke':
         return {
-            'max_train_fusion_epochs': 100,
+            'max_train_fusion_epochs': 101,
             'max_test_fusion_epochs': 50,
             'training_epochs': 5,
         }
